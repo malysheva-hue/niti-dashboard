@@ -292,6 +292,195 @@ def render_manager_block(manager: str, findings: list[Finding], data: dict) -> s
 
 
 # ============================================================
+# STARS_STATUS — информационные карточки звёзд (всегда 4)
+# ============================================================
+def _star_tempo(cur_revenue, prev_revenue, target_growth_pct, month_str):
+    """Темп звезды: cur / (prev × (1 + target_growth) × dop/dim) × 100."""
+    if not prev_revenue or cur_revenue is None or month_str is None:
+        return None
+    target = prev_revenue * (1 + (target_growth_pct or 0) / 100)
+    if target <= 0:
+        return None
+    from datetime import date as _date
+    try:
+        y, m = (int(x) for x in month_str.split("-"))
+    except (ValueError, TypeError):
+        return None
+    dim = (_date(y if m < 12 else y + 1, (m % 12) + 1, 1) - _date(y, m, 1)).days
+    today = _date.today()
+    if today.year == y and today.month == m:
+        dop = today.day
+    elif today > _date(y, m, dim):
+        dop = dim
+    else:
+        dop = 0
+    if dop == 0:
+        return None
+    expected = target * dop / dim
+    if expected == 0:
+        return None
+    return cur_revenue / expected * 100
+
+
+def _fmt_pct_delta(curr, prev):
+    if curr is None or prev is None or prev == 0:
+        return None
+    pct = (curr - prev) / abs(prev) * 100
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:.0f}%"
+
+
+def _fmt_pp_delta(curr, prev):
+    if curr is None or prev is None:
+        return None
+    delta = curr - prev
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta:.1f}пп"
+
+
+def _classify_star(cur_month: dict, tempo: float | None, role: str):
+    """Возвращает (status, reason)."""
+    margin = cur_month.get("margin") if cur_month else None
+    drr = cur_month.get("drr") if cur_month else None
+    stock = cur_month.get("stock") if cur_month else None
+    orders = (cur_month or {}).get("orders") or 0
+
+    # red checks
+    if stock == 0 and orders > 0:
+        return "red", "OOS при активных заказах"
+    if margin is not None and margin < 0:
+        return "red", f"маржа {margin:.1f}% — убыточный"
+    if tempo is not None and tempo < 70:
+        return "red", f"темп {tempo:.0f}% — отстаёт"
+
+    # role norms
+    norms = ctx.ROLE_NORMS.get(role, {})
+    m_min = norms.get("margin_min")
+    drr_max = norms.get("drr_max")
+
+    margin_ok = m_min is None or (margin is not None and margin >= m_min)
+    drr_ok = drr_max is None or (drr is not None and drr <= drr_max)
+    tempo_ok = tempo is None or tempo >= 85
+
+    # yellow: проседает одна метрика
+    if not margin_ok and margin is not None:
+        return "yellow", f"маржа {margin:.1f}% (норма ≥{m_min}%)"
+    if not drr_ok and drr is not None:
+        return "yellow", f"ДРР {drr:.1f}% (норма ≤{drr_max}%)"
+    if tempo is not None and tempo < 85:
+        return "yellow", f"темп {tempo:.0f}% — на грани"
+
+    if tempo is None:
+        return "green", "в норме (темп не вычислим)"
+    return "green", f"темп {tempo:.0f}% — норма"
+
+
+def render_stars_status(data: dict) -> list[dict]:
+    current = (data.get("meta") or {}).get("current_month")
+    months_all = (data.get("meta") or {}).get("available_months") or []
+    prev = None
+    if current in months_all:
+        idx = months_all.index(current)
+        if idx > 0:
+            prev = months_all[idx - 1]
+
+    cur_stars = (data.get("stars_monthly") or {}).get(current, {}) or {}
+    prv_stars = (data.get("stars_monthly") or {}).get(prev, {}) or {}
+    months_data = data.get("_months_data") or {}
+    cur_idx = {r["code"]: r for r in months_data.get(current, [])}
+    prv_idx = {r["code"]: r for r in months_data.get(prev, [])}
+    sku_history = data.get("sku_history") or {}
+
+    out = []
+    for s in ctx.STARS:
+        code = s["code"]
+        cur = cur_stars.get(code, {}) or {}
+        prv = prv_stars.get(code, {}) or {}
+        cur_full = cur_idx.get(code, {})
+        prv_full = prv_idx.get(code, {})
+
+        # days_to_oos: stock / velocity_7d (из истории)
+        velocity_7d = None
+        history = sku_history.get(code) or {}
+        orders_arr = history.get("orders") or []
+        last7 = [o for o in orders_arr[-7:] if o is not None]
+        if last7:
+            velocity_7d = sum(last7) / len(last7)
+        days_to_oos = None
+        stock_now = cur.get("stock")
+        if stock_now is not None and velocity_7d and velocity_7d > 0:
+            days_to_oos = stock_now / velocity_7d
+
+        # темп
+        tempo = _star_tempo(cur.get("revenue"), prv.get("revenue"),
+                            s.get("target_growth_pct"), current)
+        # status
+        status, reason = _classify_star(cur, tempo, s.get("role") or "Локомотив")
+
+        out.append({
+            "sku": code,
+            "name": s["name"],
+            "manager": s["manager"],
+            "status": status,
+            "status_reason": reason,
+            "metrics": {
+                "revenue_month": int(cur.get("revenue") or 0) if cur.get("revenue") is not None else None,
+                "margin_pct": round(cur.get("margin"), 1) if cur.get("margin") is not None else None,
+                "drr_pct": round(cur.get("drr"), 2) if cur.get("drr") is not None else None,
+                "tacos_pct": round(cur.get("tacos"), 2) if cur.get("tacos") is not None else None,
+                "stock": int(cur.get("stock")) if cur.get("stock") is not None else None,
+                "days_to_oos": round(days_to_oos, 1) if days_to_oos is not None else None,
+                "turnover_days": round(cur.get("turnover")) if cur.get("turnover") is not None else None,
+                "tempo_pct": round(tempo) if tempo is not None else None,
+            },
+            "delta_vs_prev_month": {
+                "revenue": _fmt_pct_delta(cur.get("revenue"), prv.get("revenue")),
+                "margin": _fmt_pp_delta(cur.get("margin"), prv.get("margin")),
+                "orders": _fmt_pct_delta(cur_full.get("orders"), prv_full.get("orders")),
+            },
+        })
+    return out
+
+
+# ============================================================
+# LOCO_RISK_STATUS — карточки топ-локомотивов (всегда 4)
+# ============================================================
+def _classify_loco(days_to_oos, stock):
+    if stock == 0:
+        return "red", "OOS — продаём с прерываниями"
+    if days_to_oos is None:
+        return "yellow", "нет данных по скорости продаж"
+    if days_to_oos < 7:
+        return "red", f"OOS через {days_to_oos:.1f} дн — критично"
+    if days_to_oos <= 14:
+        return "yellow", f"OOS через {days_to_oos:.1f} дн — следить"
+    return "green", f"OOS через {days_to_oos:.1f} дн — норма"
+
+
+def render_loco_risk_status(data: dict) -> list[dict]:
+    oos_days = data.get("oos_days") or {}
+    out = []
+    for l in ctx.LOCO_RISK_LIST:
+        code = l["code"]
+        o = oos_days.get(code, {}) or {}
+        stock = o.get("stock")
+        velocity = o.get("avg7")
+        days_left = o.get("days_left")
+        status, reason = _classify_loco(days_left, stock)
+        out.append({
+            "sku": code,
+            "name": l["name"],
+            "manager": l["manager"],
+            "stock": int(stock) if stock is not None else None,
+            "daily_velocity_7d": velocity,
+            "days_to_oos": days_left,
+            "status": status,
+            "status_reason": reason,
+        })
+    return out
+
+
+# ============================================================
 # СБОРКА ИТОГА
 # ============================================================
 def build_summary(findings: list[Finding], data: dict, engine_meta_extra: dict = None) -> dict:
@@ -308,10 +497,12 @@ def build_summary(findings: list[Finding], data: dict, engine_meta_extra: dict =
         "company_summary": company_summary,
         "manager_blocks": manager_blocks,
         "tasks": tasks,
+        "stars_status": render_stars_status(data),
+        "loco_risk_status": render_loco_risk_status(data),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "engine": "niti_v1_rules",
         "engine_meta": {
-            "version": "1.0.0",
+            "version": "1.2.0",
             "rules_active": [r for r in (engine_meta_extra or {}).get("rules_active", [])],
             **(engine_meta_extra or {}),
         },

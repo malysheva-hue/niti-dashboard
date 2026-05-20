@@ -710,6 +710,19 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
                            and not mpstats_is_stale
                            and not margin_anomaly_by_date.get(date, False))
 
+        # v1.8: месячные агрегаты по чистым дням текущего месяца
+        month_suffix = "." + ".".join(date.split(".")[1:]) if date else ""
+        clean_profit_days = [d for d in daily_mpstats_profit
+                             if d.endswith(month_suffix)
+                             and not profit_anomaly_by_date.get(d, False)]
+        profit_month_total = sum(daily_mpstats_profit[d] for d in clean_profit_days) if clean_profit_days else None
+        profit_month_avg = (profit_month_total / len(clean_profit_days)) if clean_profit_days else None
+
+        clean_margin_days = [d for d in margin_history_dict
+                             if d.endswith(month_suffix)
+                             and not margin_anomaly_by_date.get(d, False)]
+        margin_month_avg = (sum(margin_history_dict[d] for d in clean_margin_days) / len(clean_margin_days)) if clean_margin_days else None
+
         # Разбивка по менеджеру: используем voronka.orders по SKU + profit_per_unit
         # как фолбэк (на уровне менеджера дневной MPSTATS-профит не очень информативен).
         by_sku = funnels_by_sku.get(date, {})
@@ -742,12 +755,17 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             "profit_is_anomaly": prof_anom["is_anomaly"],
             "profit_anomaly_meta": prof_anom,
             "profit_raw": round_n(profit_total, 0) if profit_total is not None else None,
+            "profit_month_total": round_n(profit_month_total, 0) if profit_month_total is not None else None,
+            "profit_month_avg":   round_n(profit_month_avg, 0)   if profit_month_avg   is not None else None,
+            "profit_month_clean_days": len(clean_profit_days),
             "margin": round_n(margin_val, 2) if margin_val is not None else None,
             "margin_is_clean": margin_is_clean,
             "margin_is_stale": profit_stale,
             "margin_is_anomaly": marg_anom["is_anomaly"],
             "margin_anomaly_meta": marg_anom,
             "margin_raw": round_n(margin_val, 2) if margin_val is not None else None,
+            "margin_month_avg": round_n(margin_month_avg, 2) if margin_month_avg is not None else None,
+            "margin_month_clean_days": len(clean_margin_days),
             "source": "funnel+mpstats",
             "by_manager": {m: {
                 "revenue": round_n(v["revenue"], 0) if v["revenue"] else None,

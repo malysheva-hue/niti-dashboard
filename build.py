@@ -31,15 +31,28 @@ DATA_JSON = ROOT / "data.json"
 
 INCOMPLETE_MONTHS = {"2025-06", "2026-05"}
 NO_MANAGERS_MONTHS = {"2026-02"}
-DEFAULT_MONTH = "2026-04"
+DEFAULT_MONTH = "2026-05"
 
 NAME_NORMALIZE = {
     "Цигельникова Виктория": "Виктория",
 }
 
+# v2: Антон — РОП, его SKU перешли к Владимиру (передача дел с 06.2025).
+# Везде на дашборде «Антон» как менеджер → «Владимир».
+MANAGER_REMAP = {"Антон": "Владимир"}
+
+def remap_mgr(name):
+    if not name:
+        return name
+    name = NAME_NORMALIZE.get(name, name)
+    return MANAGER_REMAP.get(name, name)
+
 STAR_CODES = {"КЛ007", "КЛ003", "ЛК013", "ПВС002"}
 LOCO_RISK_CODES = {"ПС002", "ФМПНН0032", "ЮТ001", "ЮТ002"}
-ACTIVE_MANAGERS = {"Виктория", "Настя", "Антон", "Владимир"}
+ACTIVE_MANAGERS = {"Виктория", "Настя", "Владимир"}
+AI_SUMMARY_FILE = ROOT / "data" / "ai_summary.json"
+DAILY_REVENUE_FILE = CSV_DIR / "Дневная_Сумма_заказов.csv"
+DAILY_PROFIT_FILE = CSV_DIR / "Дневная_Прибыль.csv"
 
 
 def num(v):
@@ -86,21 +99,29 @@ def parse_summary_csv():
 
 def parse_managers_csv():
     out = defaultdict(dict)
+    field_map = [
+        ("Сумма заказов, руб", "revenue"),
+        ("Факт заказов, шт", "orders"),
+        ("Прибыль, руб", "profit"),
+        ("Рекламные расходы, руб", "ad_spend"),
+        ("Замороженный капитал", "frozen"),
+    ]
     with open(CSV_DIR / "01_Менеджеры_по_месяцам.csv", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             m = row.get("Месяц")
             mgr = row.get("Менеджер")
             if not m or not mgr:
                 continue
-            mgr = NAME_NORMALIZE.get(mgr, mgr)
-            out[m][mgr] = {
-                "revenue": num(row.get("Сумма заказов, руб")),
-                "orders": num(row.get("Факт заказов, шт")),
-                "profit": num(row.get("Прибыль, руб")),
-                "ad_spend": num(row.get("Рекламные расходы, руб")),
-                "frozen": num(row.get("Замороженный капитал")),
-                "margin": num(row.get("Маржа %")),
-            }
+            mgr = remap_mgr(mgr)
+            acc = out[m].setdefault(mgr, {k: 0.0 for _, k in field_map})
+            for src, dst in field_map:
+                v = num(row.get(src))
+                if v is not None:
+                    acc[dst] = (acc[dst] or 0) + v
+    # пересчёт взвешенной маржи после агрегации
+    for m_key, mgrs in out.items():
+        for mgr_key, d in mgrs.items():
+            d["margin"] = (d["profit"] / d["revenue"] * 100) if d.get("revenue") else None
     return dict(out)
 
 
@@ -153,7 +174,7 @@ def parse_sku_monthly_csv():
         with open(path, encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 mgr = row.get("Менеджер") or ""
-                mgr = NAME_NORMALIZE.get(mgr, mgr)
+                mgr = remap_mgr(mgr)
                 rows.append({
                     "code": row.get("Артикул поставщика"),
                     "sku": row.get("SKU"),
@@ -425,6 +446,149 @@ def compute_stars(sku_monthly):
     return out
 
 
+def parse_daily_yesterday(sku_monthly):
+    """Читает Дневная_Сумма_заказов и Дневная_Прибыль (длинный формат:
+    Артикул, SKU, Показатель, Название, Дата, Значение). Возвращает блок
+    «за последний день» + «за позавчера»: общая выручка/прибыль/маржа
+    и разбивка по менеджеру."""
+    if not DAILY_REVENUE_FILE.exists():
+        return None
+
+    def read_long(path):
+        # {date: {code: value}}
+        data = defaultdict(dict)
+        with open(path, encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                code = row.get("Артикул поставщика")
+                date = row.get("Дата")
+                v = num(row.get("Значение"))
+                if not code or not date or v is None:
+                    continue
+                data[date][code] = data[date].get(code, 0) + v
+        return data
+
+    rev_by_date = read_long(DAILY_REVENUE_FILE)
+    prof_by_date = read_long(DAILY_PROFIT_FILE) if DAILY_PROFIT_FILE.exists() else {}
+    if not rev_by_date:
+        return None
+
+    # последняя и предпоследняя даты
+    dates = sorted(rev_by_date.keys())
+    last = dates[-1]
+    prev = dates[-2] if len(dates) >= 2 else None
+
+    # карта code → manager (из последнего месячного среза)
+    code_to_manager = {}
+    for month in sorted(sku_monthly.keys(), reverse=True):
+        for r in sku_monthly[month]:
+            c, m = r.get("code"), r.get("manager")
+            if c and m and c not in code_to_manager:
+                code_to_manager[c] = m
+
+    def snapshot(date):
+        if date is None:
+            return None
+        rev_map = rev_by_date.get(date, {})
+        prof_map = prof_by_date.get(date, {})
+        total_rev = sum(rev_map.values())
+        total_prof = sum(prof_map.values())
+        by_mgr = {m: {"revenue": 0.0, "profit": 0.0} for m in ACTIVE_MANAGERS}
+        for code, rev in rev_map.items():
+            mgr = code_to_manager.get(code)
+            if mgr in by_mgr:
+                by_mgr[mgr]["revenue"] += rev
+        for code, prof in prof_map.items():
+            mgr = code_to_manager.get(code)
+            if mgr in by_mgr:
+                by_mgr[mgr]["profit"] += prof
+        for mgr in by_mgr:
+            r = by_mgr[mgr]
+            r["margin"] = (r["profit"] / r["revenue"] * 100) if r["revenue"] else None
+        return {
+            "date": date,
+            "revenue": round_n(total_rev, 0),
+            "profit": round_n(total_prof, 0),
+            "margin": round_n(total_prof / total_rev * 100, 2) if total_rev else None,
+            "by_manager": {m: {
+                "revenue": round_n(v["revenue"], 0),
+                "profit": round_n(v["profit"], 0),
+                "margin": round_n(v["margin"], 1) if v["margin"] is not None else None,
+            } for m, v in by_mgr.items()},
+        }
+
+    return {"last": snapshot(last), "prev": snapshot(prev)}
+
+
+DAILY_FILES_FOR_HISTORY = {
+    "orders": "Дневная_Факт_заказов.csv",
+    "revenue": "Дневная_Сумма_заказов.csv",
+    "stock": "Дневная_Остаток.csv",
+    "spp": "Дневная_СПП.csv",
+    "price": "Дневная_Цена_после_СПП.csv",
+}
+
+
+def parse_daily_history(sku_monthly, current_month, top_n=100):
+    """Для топ-N SKU выбранного месяца — 30-дневная история по 5 метрикам.
+    Возвращает {code: {dates, orders, revenue, stock, spp, price}}."""
+    if current_month not in sku_monthly:
+        return {}
+    rows = [r for r in sku_monthly[current_month] if r.get("revenue") and r["revenue"] > 0]
+    rows.sort(key=lambda r: r.get("revenue", 0), reverse=True)
+    top_codes = {r["code"] for r in rows[:top_n]}
+    # звёзды и локомотивы — всегда включаем
+    top_codes |= STAR_CODES | LOCO_RISK_CODES
+
+    series = {k: {} for k in DAILY_FILES_FOR_HISTORY}  # {metric: {code: {date: v}}}
+    all_dates = set()
+    for metric, fname in DAILY_FILES_FOR_HISTORY.items():
+        path = CSV_DIR / fname
+        if not path.exists():
+            continue
+        with open(path, encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                code = row.get("Артикул поставщика")
+                if not code or code not in top_codes:
+                    continue
+                date = row.get("Дата")
+                v = num(row.get("Значение"))
+                if not date or v is None:
+                    continue
+                series[metric].setdefault(code, {})[date] = v
+                all_dates.add(date)
+
+    # последние 30 дат
+    dates_30 = sorted(all_dates)[-30:]
+    out = {}
+    for code in top_codes:
+        per = {"dates": dates_30}
+        any_data = False
+        for metric in DAILY_FILES_FOR_HISTORY:
+            row = series[metric].get(code, {})
+            arr = [row.get(d) for d in dates_30]
+            per[metric] = arr
+            if any(v is not None for v in arr):
+                any_data = True
+        if any_data:
+            out[code] = per
+    return out
+
+
+def read_ai_summary():
+    """Читает data/ai_summary.json если есть, иначе заглушку."""
+    if AI_SUMMARY_FILE.exists():
+        try:
+            return json.loads(AI_SUMMARY_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  ⚠ ai_summary.json повреждён: {e}")
+    return {
+        "company_summary": "AI-сводка не настроена или ещё не сгенерирована. Запусти `python3 update.py` — Gemini проанализирует данные за вчера и сгенерирует сводку.",
+        "manager_blocks": {"Виктория": "", "Настя": "", "Владимир": ""},
+        "tasks": [],
+        "generated_at": None,
+    }
+
+
 def read_daily_summary():
     if DAILY_SUMMARY_MD.exists():
         return DAILY_SUMMARY_MD.read_text(encoding="utf-8")
@@ -510,6 +674,18 @@ def main():
     stars = compute_stars(sku_monthly)
     top_by_manager = compute_top_by_manager(sku_year, sku_monthly)
 
+    print("[7b] дневные данные (вчера/позавчера)...")
+    yesterday = parse_daily_yesterday(sku_monthly)
+    if yesterday and yesterday.get("last"):
+        print(f"        последний день в данных: {yesterday['last']['date']}")
+
+    print("[7c] 30-дневная история топ-100 SKU для модалок...")
+    sku_history = parse_daily_history(sku_monthly, DEFAULT_MONTH, top_n=100)
+    print(f"        SKU в истории: {len(sku_history)}")
+
+    print("[7d] ai_summary.json...")
+    ai_summary = read_ai_summary()
+
     print("[8/8] daily_summary.md и финальная сборка...")
     summary_md = read_daily_summary()
 
@@ -534,6 +710,9 @@ def main():
         "oos_days": oos,
         "prices": prices,
         "funnels": funnels,
+        "yesterday": yesterday,
+        "sku_history": sku_history,
+        "ai_summary": ai_summary,
         "daily_summary_md": summary_md,
     }
 

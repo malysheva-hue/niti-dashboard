@@ -13,6 +13,7 @@ data/Сжатые файлы НТ год/
 # Локальные md/xlsx внутри data
 data/*.md
 data/*.xlsx
+data/ai_summary.json
 
 # Артефакты
 *.xlsx
@@ -21,3 +22,6 @@ data/*.xlsx
 __pycache__/
 .DS_Store
 .venv/
+
+# Секреты — НИКОГДА не коммитим
+.env

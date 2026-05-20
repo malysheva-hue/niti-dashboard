@@ -45,7 +45,8 @@ def _problem_text(finding: Finding) -> str:
     if rid == "DRR_RUNAWAY":
         return phrases.render_phrase("problem_one_liner_drr",
                                      value=round(m.get("drr") or 0, 1),
-                                     max=norms.get("drr_max") or 10)
+                                     max=norms.get("drr_max") or 10,
+                                     role=role or "—")
     if rid in ("OOS_IMMINENT", "LOCO_RISK_OOS"):
         days = finding.diagnostics_details.get("oos_risk", {}).get("days") \
             or finding.diagnostics_details.get("critical_oos", {}).get("days") \
@@ -88,23 +89,122 @@ def _fmt_rub(v) -> str:
     return f"{int(v)}"
 
 
+def _delta_pct(a, b):
+    if a is None or b is None or a == 0:
+        return None
+    return (b - a) / abs(a) * 100
+
+
+def _build_changes(sku: dict) -> list[dict]:
+    """v1.8: для карточки — что изменилось за 7 дней.
+    Сравниваем последние 7 дней vs предыдущие 7.
+    Метрики: цена после СПП, остаток, заказы/день.
+    Возвращает [{label, from, to, delta_pct, delta_dir, is_bad, unit}].
+    """
+    h = sku.get("history") or {}
+
+    def mean_last(arr, n):
+        if not arr:
+            return None
+        tail = [v for v in arr[-n:] if v is not None]
+        return sum(tail) / len(tail) if tail else None
+
+    def mean_window(arr, end_excl, n):
+        if not arr or end_excl < n:
+            return None
+        win = [v for v in arr[end_excl - n:end_excl] if v is not None]
+        return sum(win) / len(win) if win else None
+
+    changes = []
+
+    orders = h.get("orders") or []
+    if len(orders) >= 14:
+        prev7 = mean_window(orders, len(orders) - 7, 7)
+        last7 = mean_last(orders, 7)
+        if prev7 is not None and last7 is not None and prev7 > 0:
+            dp = _delta_pct(prev7, last7)
+            changes.append({
+                "label": "Заказы/день",
+                "from": round(prev7, 1),
+                "to": round(last7, 1),
+                "delta_pct": round(dp, 1),
+                "delta_dir": "up" if dp > 0 else "down" if dp < 0 else "flat",
+                "is_bad": dp < -5,
+                "unit": "шт",
+            })
+
+    price = h.get("price") or []
+    if len(price) >= 14:
+        prev7 = mean_window(price, len(price) - 7, 7)
+        last7 = mean_last(price, 7)
+        if prev7 is not None and last7 is not None and prev7 > 0:
+            dp = _delta_pct(prev7, last7)
+            changes.append({
+                "label": "Цена после СПП",
+                "from": round(prev7, 0),
+                "to": round(last7, 0),
+                "delta_pct": round(dp, 1),
+                "delta_dir": "up" if dp > 0 else "down" if dp < 0 else "flat",
+                "is_bad": False,  # цена сама по себе не «плохо»/«хорошо»
+                "unit": "₽",
+            })
+
+    stock = h.get("stock") or []
+    if len(stock) >= 14:
+        prev_val = stock[-8] if len(stock) >= 8 and stock[-8] is not None else None
+        last_val = stock[-1] if stock and stock[-1] is not None else None
+        if prev_val and last_val is not None:
+            dp = _delta_pct(prev_val, last_val)
+            changes.append({
+                "label": "Остаток",
+                "from": int(prev_val),
+                "to": int(last_val),
+                "delta_pct": round(dp, 1) if dp is not None else None,
+                "delta_dir": "up" if (dp or 0) > 0 else "down" if (dp or 0) < 0 else "flat",
+                "is_bad": dp is not None and dp < -20,
+                "unit": "шт",
+            })
+
+    return changes
+
+
+def _build_verdict(changes: list[dict], priority: str) -> tuple[str, str]:
+    """По changes и priority определяем «стало лучше / хуже / без изменений»."""
+    if not changes:
+        return ("Изменения за 7 дней не определены.", "same")
+    bad = sum(1 for c in changes if c.get("is_bad"))
+    bad_dir = sum(1 for c in changes if c.get("delta_dir") == "down" and c.get("label") in ("Заказы/день", "Остаток"))
+    if bad >= 2 or priority == "red":
+        return ("Стало хуже за 7 дней.", "worse")
+    if bad == 0 and bad_dir == 0:
+        return ("Стабильно за 7 дней.", "better" if priority == "yellow" else "same")
+    return ("Смешанная динамика за 7 дней.", "same")
+
+
 def render_task(finding: Finding) -> dict:
-    """Один объект task для ai_summary.json."""
+    """v1.8: расширенная структура задачи — attention / changes / variants / verdict."""
     sku = finding.sku_data
-    problem = _problem_text(finding)
-    action_short = actions.render_action(finding.action_key, sku, finding)
-    # action_extended — для модалки. Можем сделать чуть подробнее, но
-    # пока берём тот же action_short с добавлением контекста.
-    action_ext = _build_action_extended(finding, action_short)
+    attention = _problem_text(finding)
+    variants = actions.get_variants(finding.rule_id)
+    changes = _build_changes(sku)
+    verdict_text, verdict_dir = _build_verdict(changes, finding.priority)
 
     return {
         "sku": finding.sku_code,
         "manager": finding.manager,
         "priority": finding.priority,
         "task_type": finding.task_type,
-        "problem": problem,
-        "action": action_short,
-        "action_extended": action_ext,
+        # v1.8 daily contract:
+        "attention": attention,
+        "changes": changes,
+        "variants": variants,
+        "verdict": verdict_text,
+        "verdict_dir": verdict_dir,
+        # обратная совместимость для модалки SKU и старого UI:
+        "problem": attention,
+        "action": variants[0] if variants else "",
+        "action_extended": "\n• ".join([""] + variants) if variants else "",
+        # технические поля:
         "diagnostics": finding.diagnostics,
         "severity_score": finding.severity_score,
         "rule_id": finding.rule_id,
@@ -230,6 +330,38 @@ def render_company_summary(findings: list[Finding], data: dict) -> str:
         lines.append(phrases.render_phrase("tasks_summary",
                                            total=len(findings),
                                            red=red_n, yellow=yellow_n, opp=opp_n))
+
+    # 6. v1.8: контекст «К вчера» и «К плану мая»
+    y = data.get("yesterday") or {}
+    last_y = y.get("last") or {}
+    prev_y = y.get("prev") or {}
+    if last_y and prev_y and last_y.get("revenue") and prev_y.get("revenue"):
+        dlt_rev = (last_y["revenue"] - prev_y["revenue"]) / prev_y["revenue"] * 100
+        sign = "+" if dlt_rev >= 0 else "−"
+        rev_part = f"выручка {sign}{abs(dlt_rev):.0f}%"
+        profit_part = "прибыль ждёт загрузки" if not last_y.get("profit_is_clean") else ""
+        if last_y.get("profit_is_clean") and prev_y.get("profit_is_clean"):
+            dlt_p = (last_y["profit"] - prev_y["profit"]) / abs(prev_y["profit"]) * 100 if prev_y["profit"] else 0
+            sgn = "+" if dlt_p >= 0 else "−"
+            profit_part = f"прибыль {sgn}{abs(dlt_p):.0f}%"
+        try:
+            prev_date_human = prev_y.get("date", "").split(".")[0] + "." + prev_y.get("date", "").split(".")[1]
+        except Exception:
+            prev_date_human = prev_y.get("date", "")
+        parts = [rev_part]
+        if profit_part:
+            parts.append(profit_part)
+        lines.append(f"К {prev_date_human} (вчера): {', '.join(parts)}.")
+
+    if pace is not None and plan_company:
+        cur_rev_month = cur.get("revenue") or 0
+        gap = plan_company - cur_rev_month
+        gap_m = f"{abs(gap)/1e6:.2f}".replace(".", ",")
+        plan_m = f"{plan_company/1e6:.2f}".replace(".", ",")
+        if pace >= 100:
+            lines.append(f"К плану мая: {pace:.0f}% темпа, идём с опережением {gap_m} М ₽.")
+        else:
+            lines.append(f"К плану мая: {pace:.0f}% темпа, отстаём {gap_m} М до плана {plan_m} М.")
 
     return "\n".join(lines)
 

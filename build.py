@@ -288,7 +288,7 @@ def parse_plan_fact_xlsx():
 def parse_funnels_xlsx():
     """Дневные воронки → {
         'by_code': {date: {code: {shows,ctr,clicks,carts}}}  # ТОЛЬКО для звёзд и топ-локо
-        'overall': {date: {shows, clicks, carts, ctr_avg}}    # суммарно по всем SKU за день
+        'overall': {date: {shows, clicks, carts, ctr_avg, orders_amount, buyouts_amount, buyout_pct}}
     }."""
     import openpyxl
     targeted = STAR_CODES | LOCO_RISK_CODES
@@ -325,11 +325,35 @@ def parse_funnels_xlsx():
             if code in targeted:
                 day_data[code] = {"shows": shows, "ctr": ctr, "clicks": clicks, "carts": carts}
         by_code[day_iso] = day_data
+
+        # v2.3.1: лист «Фильтры» даёт суточные итоги выкупов и заказов
+        orders_amount = buyouts_amount = buyout_pct = None
+        try:
+            ws2 = wb["Фильтры"]
+            rr2 = list(ws2.iter_rows(values_only=True))
+            if len(rr2) >= 3:
+                h2 = rr2[1]
+                vals = rr2[2]
+                ix = {h: i for i, h in enumerate(h2) if h}
+                def gv(name):
+                    i = ix.get(name)
+                    if i is None: return None
+                    v = vals[i]
+                    return float(v) if isinstance(v, (int, float)) else None
+                orders_amount = gv("Заказали на сумму, ₽")
+                buyouts_amount = gv("Выкупили на сумму, ₽")
+                buyout_pct = gv("Процент выкупа")
+        except KeyError:
+            pass
+
         overall[day_iso] = {
             "shows": int(sum_shows),
             "clicks": int(sum_clicks),
             "carts": int(sum_carts),
             "ctr_avg": round_n(sum(ctr_values)/len(ctr_values), 2) if ctr_values else None,
+            "orders_amount": round_n(orders_amount, 0) if orders_amount is not None else None,
+            "buyouts_amount": round_n(buyouts_amount, 0) if buyouts_amount is not None else None,
+            "buyout_pct": round_n(buyout_pct, 2) if buyout_pct is not None else None,
         }
         wb.close()
     return {"by_code": by_code, "overall": overall}
@@ -385,6 +409,94 @@ def parse_prices_xlsx():
         }
     wb.close()
     return out, src.name
+
+
+def _sum_indicator_in_month(pivot, indicator, month):
+    """Сумма значений индикатора по дням месяца. Возвращает (total, n_days).
+
+    Значения в parquet — дневная разноска (план/факт «в этот день»).
+    """
+    y, mm = month.split("-")
+    suffix = f".{mm}.{y}"
+    days = {}
+    for code_map in (pivot.get(indicator) or {}).values():
+        for d, v in code_map.items():
+            if not str(d).endswith(suffix):
+                continue
+            days[d] = days.get(d, 0) + (v or 0)
+    return (sum(days.values()) if days else 0.0, len(days))
+
+
+def _days_in_month(month):
+    from datetime import date as _date
+    y, mm = month.split("-")
+    y, mm = int(y), int(mm)
+    return (_date(y if mm < 12 else y + 1, (mm % 12) + 1, 1) - _date(y, mm, 1)).days
+
+
+def compute_month_plans(month):
+    """v2.3.1 БЛОК 1: план месяца через parquet, экстраполированный на полный месяц.
+
+    "Плановая выручка" — дневная разноска (план/день). Сумма за 19 дней × 31/19 = месячный план.
+    Возвращает {month: {revenue, orders_qty, sales_qty, order_amount, profit, margin_pct, source}}.
+    """
+    pivot = _load_history_pivot([
+        "Плановая выручка", "Плановая сумма заказов, руб",
+        "План продаж, шт", "План заказов, шт",
+        "Плановая прибыль в день, руб",
+    ])
+    if not pivot:
+        return {}
+    dim = _days_in_month(month)
+
+    def total(ind):
+        s, n = _sum_indicator_in_month(pivot, ind, month)
+        if n == 0:
+            return None
+        return s * dim / n   # экстраполяция на полный месяц
+
+    plan_rev = total("Плановая выручка")
+    plan_order_amount = total("Плановая сумма заказов, руб")
+    plan_sales_qty = total("План продаж, шт")
+    plan_orders_qty = total("План заказов, шт")
+    plan_profit = total("Плановая прибыль в день, руб")
+    if not any(v is not None for v in (plan_rev, plan_order_amount, plan_sales_qty, plan_orders_qty, plan_profit)):
+        return {}
+    margin_pct = (plan_profit / plan_rev * 100) if (plan_rev and plan_profit) else None
+    return {
+        month: {
+            "revenue":      round_n(plan_rev, 0) if plan_rev else None,
+            "order_amount": round_n(plan_order_amount, 0) if plan_order_amount else None,
+            "sales_qty":    round_n(plan_sales_qty, 0) if plan_sales_qty else None,
+            "orders_qty":   round_n(plan_orders_qty, 0) if plan_orders_qty else None,
+            "profit":       round_n(plan_profit, 0) if plan_profit else None,
+            "margin_pct":   round_n(margin_pct, 2) if margin_pct is not None else None,
+            "source":       "history.parquet (extrapolated × dim/days_with_data)",
+        }
+    }
+
+
+def compute_month_buyouts(month):
+    """v2.3.1 БЛОК 2: факт выручки (по выкупам) и сумма заказов за месяц из parquet.
+
+    "Выручка, руб" — дневная разноска по выкупам. Сумма за все дни месяца = факт месяца к этой дате.
+    """
+    pivot = _load_history_pivot(["Выручка, руб", "Выручка по заказам, руб"])
+    if not pivot:
+        return {}
+    rev_buyouts, n1 = _sum_indicator_in_month(pivot, "Выручка, руб", month)
+    rev_orders, n2 = _sum_indicator_in_month(pivot, "Выручка по заказам, руб", month)
+    if n1 == 0 and n2 == 0:
+        return {}
+    pct = (rev_buyouts / rev_orders * 100) if (rev_orders and rev_buyouts) else None
+    return {
+        month: {
+            "buyouts_amount": round_n(rev_buyouts, 0) if rev_buyouts else None,
+            "orders_amount":  round_n(rev_orders, 0) if rev_orders else None,
+            "buyout_pct":     round_n(pct, 2) if pct is not None else None,
+            "days_with_data": max(n1, n2),
+        }
+    }
 
 
 def compute_sku_plans(plan_fact):
@@ -1168,6 +1280,19 @@ def main():
     sku_plans = compute_sku_plans(plan_fact)
     print(f"        SKU c планами в xlsx: {len(sku_plans)}")
 
+    month_plans = compute_month_plans(DEFAULT_MONTH)
+    if month_plans:
+        mp = month_plans[DEFAULT_MONTH]
+        print(f"        month_plans {DEFAULT_MONTH}: rev={mp.get('revenue')}, "
+              f"sales={mp.get('sales_qty')}, profit={mp.get('profit')}, "
+              f"margin={mp.get('margin_pct')}%")
+
+    month_buyouts = compute_month_buyouts(DEFAULT_MONTH)
+    if month_buyouts:
+        mb = month_buyouts[DEFAULT_MONTH]
+        print(f"        month_buyouts {DEFAULT_MONTH}: orders={mb.get('orders_amount')}, "
+              f"buyouts={mb.get('buyouts_amount')}, pct={mb.get('buyout_pct')}%")
+
     common = {
         "meta": {
             "last_updated": latest_mtime(),
@@ -1193,6 +1318,8 @@ def main():
         "sku_history": sku_history,
         "sku_history_monthly": sku_history_monthly,
         "sku_plans": sku_plans,
+        "month_plans": month_plans,
+        "month_buyouts": month_buyouts,
         "ai_summary": ai_summary,
         "daily_summary_md": summary_md,
     }

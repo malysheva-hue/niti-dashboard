@@ -620,7 +620,7 @@ def render_company_summary(findings: list[Finding], data: dict) -> str:
 
     # темп месяца — считаем локально
     pace = None
-    plan_company = _get_plan_company(current)
+    plan_company = _get_plan_company(current, data)
     if plan_company and cur.get("revenue"):
         from datetime import date
         y, m_ = (int(x) for x in current.split("-"))
@@ -768,11 +768,17 @@ def render_company_summary(findings: list[Finding], data: dict) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _get_plan_company(month: str) -> float | None:
-    PLANS = {
-        "2026-05": 32760000, "2026-06": 37000000, "2026-07": 47780000, "2026-08": 42000000,
+def _get_plan_company(month: str, data: dict = None) -> float | None:
+    """v2.3.1: план месяца берётся из data['month_plans'][month].revenue.
+    Хардкоды-фолбэк оставлены только для будущих месяцев без xlsx."""
+    if data:
+        mp = (data.get("month_plans") or {}).get(month) or {}
+        if mp.get("revenue"):
+            return mp["revenue"]
+    FALLBACK = {
+        "2026-06": 37000000, "2026-07": 47780000, "2026-08": 42000000,
     }
-    return PLANS.get(month)
+    return FALLBACK.get(month)
 
 
 # ============================================================

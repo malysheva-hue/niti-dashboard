@@ -638,8 +638,27 @@ def emit(common_data, months_data):
         html = INDEX_HTML.read_text(encoding="utf-8")
         common_json = json.dumps(common_data, ensure_ascii=False, separators=(",", ":"))
         months_json = json.dumps(compact_months, ensure_ascii=False, separators=(",", ":"))
-        html = html.replace("/* APP_DATA_PLACEHOLDER */", common_json)
-        html = html.replace("/* MONTHS_DATA_PLACEHOLDER */", months_json)
+
+        # 1. Первый прогон: маркеры присутствуют → простая замена.
+        # 2. Повторные прогоны: маркеров уже нет, заменяем по anchor-границам.
+        if "/* APP_DATA_PLACEHOLDER */" in html:
+            html = html.replace("/* APP_DATA_PLACEHOLDER */", common_json)
+            html = html.replace("/* MONTHS_DATA_PLACEHOLDER */", months_json)
+        else:
+            import re
+            # APP_DATA — от 'const APP_DATA = ' до ';\nconst MONTHS_DATA = '
+            html = re.sub(
+                r"const APP_DATA = .+?;\nconst MONTHS_DATA = ",
+                "const APP_DATA = " + common_json.replace("\\", "\\\\") + ";\nconst MONTHS_DATA = ",
+                html, count=1, flags=re.DOTALL,
+            )
+            # MONTHS_DATA — от 'const MONTHS_DATA = ' до ';\n' до конца JS-блока.
+            # Ищем строку 'const MONTHS_DATA = ...;\n' (до перевода + следующей строки кода).
+            html = re.sub(
+                r"const MONTHS_DATA = .+?;\n",
+                "const MONTHS_DATA = " + months_json.replace("\\", "\\\\") + ";\n",
+                html, count=1, flags=re.DOTALL,
+            )
         INDEX_HTML.write_text(html, encoding="utf-8")
 
 

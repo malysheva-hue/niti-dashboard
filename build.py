@@ -309,7 +309,8 @@ def parse_prices_xlsx():
         return {}, None
     src = candidates[0]
     wb = openpyxl.load_workbook(src, data_only=True)
-    ws = wb["Лист1"]
+    # имя листа меняется от выгрузки к выгрузке — берём первый
+    ws = wb[wb.sheetnames[0]]
     rows = list(ws.iter_rows(values_only=True))
     if len(rows) < 2:
         wb.close()
@@ -461,38 +462,114 @@ def compute_stars(sku_monthly):
     return out
 
 
-def parse_daily_yesterday(sku_monthly):
-    """Читает Дневная_Сумма_заказов и Дневная_Прибыль (длинный формат:
-    Артикул, SKU, Показатель, Название, Дата, Значение). Возвращает блок
-    «за последний день» + «за позавчера»: общая выручка/прибыль/маржа
-    и разбивка по менеджеру."""
-    if not DAILY_REVENUE_FILE.exists():
+def parse_daily_yesterday(sku_monthly, plan_fact=None):
+    """v1.4: воронка (inputs/*воронка*.xlsx) — источник правды для дневных
+    выручки/заказов. Прибыль/маржа — из MPSTATS profit_per_unit с пометкой
+    is_stale если MPSTATS отстал >1 дня.
+
+    Возвращает {last, prev} со снепшотами выручки/прибыли/маржи общими и
+    по менеджерам, плюс staleness-флаги.
+    """
+    import openpyxl
+    import re as _re
+    from datetime import date as _d
+
+    funnels = {}
+    funnels_by_sku = {}  # {date: {code: orders_sku}}
+    for path in sorted(INPUTS_DIR.glob("*воронка*.xlsx")):
+        m = _re.search(r"с (\d+)-(\d+)-(\d+) по", path.name)
+        if not m:
+            continue
+        date_csv = f"{m.group(1).zfill(2)}.{m.group(2).zfill(2)}.{m.group(3)}"
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb["Фильтры"]
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) < 3:
+            wb.close()
+            continue
+        header = rows[1]
+        values = rows[2]
+        idx = {h: i for i, h in enumerate(header) if h}
+        def get(name):
+            i = idx.get(name)
+            if i is None: return None
+            v = values[i]
+            return float(v) if isinstance(v, (int, float)) else None
+        funnels[date_csv] = {
+            "revenue": get("Заказали на сумму, ₽"),
+            "orders":  get("Заказали, шт"),
+            "buyouts_qty":    get("Выкупили, шт"),
+            "buyouts_amount": get("Выкупили на сумму, ₽"),
+            "avg_price":      get("Средняя цена, ₽"),
+            "buyout_pct":     get("Процент выкупа"),
+            "shows":   get("Показы"),
+            "clicks":  get("Переходы в карточку"),
+            "carts":   get("Положили в корзину"),
+        }
+        # лист Товары для разбивки по SKU
+        try:
+            ws2 = wb["Товары"]
+            rr = list(ws2.iter_rows(values_only=True))
+            if len(rr) >= 3:
+                h2 = rr[1]
+                idx2 = {h: i for i, h in enumerate(h2) if h}
+                code_i = idx2.get("Артикул продавца")
+                orders_i = idx2.get("Заказали, шт")
+                rev_i = idx2.get("Заказали на сумму, ₽")
+                day_data = {}
+                for r in rr[2:]:
+                    if code_i is None or r[code_i] is None:
+                        continue
+                    code = r[code_i]
+                    o = r[orders_i] if orders_i is not None else None
+                    rv = r[rev_i] if rev_i is not None else None
+                    day_data[code] = {
+                        "orders": float(o) if isinstance(o, (int, float)) else 0.0,
+                        "revenue": float(rv) if isinstance(rv, (int, float)) else 0.0,
+                    }
+                funnels_by_sku[date_csv] = day_data
+        except KeyError:
+            pass
+        wb.close()
+
+    if not funnels:
         return None
 
-    def read_long(path):
-        # {date: {code: value}}
-        data = defaultdict(dict)
-        with open(path, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                code = row.get("Артикул поставщика")
-                date = row.get("Дата")
-                v = num(row.get("Значение"))
-                if not code or not date or v is None:
+    dates = sorted(funnels.keys(), key=_date_key)
+    last_d = dates[-1]
+    prev_d = dates[-2] if len(dates) >= 2 else None
+
+    # profit_per_unit из MPSTATS (план-факт)
+    profit_per_unit = {}
+    if plan_fact:
+        for code, indicators in plan_fact.items():
+            pu = num((indicators.get("Прибыль на 1 выкуп, руб") or {}).get("totals"))
+            if pu is not None:
+                profit_per_unit[code] = pu
+
+    # mpstats_last_date: на какую дату есть данные в plan_fact
+    mpstats_last_date = None
+    if plan_fact:
+        # перебираем дневные значения «Сумма заказов, руб» — берём max дату где значение !=0/None
+        for code, indicators in plan_fact.items():
+            rev_ind = indicators.get("Сумма заказов, руб") or {}
+            for k, v in rev_ind.items():
+                if k == "totals":
                     continue
-                data[date][code] = data[date].get(code, 0) + v
-        return data
+                # k — это "01.05.2026"
+                if v and isinstance(v, (int, float)) and v > 0:
+                    if mpstats_last_date is None or _date_key(k) > _date_key(mpstats_last_date):
+                        mpstats_last_date = k
+    today_str = _d.today().strftime("%d.%m.%Y")
+    if mpstats_last_date:
+        days_behind = (_d.today() - _d(_date_key(mpstats_last_date)[0],
+                                        _date_key(mpstats_last_date)[1],
+                                        _date_key(mpstats_last_date)[2])).days
+    else:
+        days_behind = None
+    mpstats_is_stale = (days_behind is None) or (days_behind > 1)
 
-    rev_by_date = read_long(DAILY_REVENUE_FILE)
-    prof_by_date = read_long(DAILY_PROFIT_FILE) if DAILY_PROFIT_FILE.exists() else {}
-    if not rev_by_date:
-        return None
-
-    # последняя и предпоследняя даты (сортировка по (yyyy,mm,dd), не лексикографически)
-    dates = sorted(rev_by_date.keys(), key=_date_key)
-    last = dates[-1]
-    prev = dates[-2] if len(dates) >= 2 else None
-
-    # карта code → manager (из последнего месячного среза)
+    # карта code → manager (из последнего месячного среза, где есть колонка)
     code_to_manager = {}
     for month in sorted(sku_monthly.keys(), reverse=True):
         for r in sku_monthly[month]:
@@ -503,35 +580,76 @@ def parse_daily_yesterday(sku_monthly):
     def snapshot(date):
         if date is None:
             return None
-        rev_map = rev_by_date.get(date, {})
-        prof_map = prof_by_date.get(date, {})
-        total_rev = sum(rev_map.values())
-        total_prof = sum(prof_map.values())
-        by_mgr = {m: {"revenue": 0.0, "profit": 0.0} for m in ACTIVE_MANAGERS}
-        for code, rev in rev_map.items():
+        f = funnels.get(date, {})
+        revenue = f.get("revenue")
+        orders = f.get("orders")
+
+        # прибыль через profit_per_unit × orders_sku
+        by_sku = funnels_by_sku.get(date, {})
+        profit_total = None
+        if by_sku and profit_per_unit:
+            acc = 0.0
+            counted = 0
+            for code, vals in by_sku.items():
+                pu = profit_per_unit.get(code)
+                o = vals.get("orders") or 0
+                if pu is not None and o > 0:
+                    acc += pu * o
+                    counted += 1
+            if counted >= 5:
+                profit_total = acc
+        # is_stale: либо MPSTATS отстал, либо прибыль не вычислилась
+        profit_stale = mpstats_is_stale or profit_total is None
+
+        margin = (profit_total / revenue * 100) if (revenue and profit_total is not None) else None
+
+        # разбивка по менеджеру: воронка по SKU → join manager
+        by_mgr = {m: {"revenue": 0.0, "orders": 0.0, "profit": 0.0, "_n_sku_profit": 0} for m in ACTIVE_MANAGERS}
+        for code, vals in by_sku.items():
             mgr = code_to_manager.get(code)
-            if mgr in by_mgr:
-                by_mgr[mgr]["revenue"] += rev
-        for code, prof in prof_map.items():
-            mgr = code_to_manager.get(code)
-            if mgr in by_mgr:
-                by_mgr[mgr]["profit"] += prof
+            if mgr not in by_mgr:
+                continue
+            by_mgr[mgr]["revenue"] += vals.get("revenue") or 0
+            by_mgr[mgr]["orders"]  += vals.get("orders") or 0
+            pu = profit_per_unit.get(code)
+            o = vals.get("orders") or 0
+            if pu is not None and o > 0:
+                by_mgr[mgr]["profit"] += pu * o
+                by_mgr[mgr]["_n_sku_profit"] += 1
         for mgr in by_mgr:
             r = by_mgr[mgr]
-            r["margin"] = (r["profit"] / r["revenue"] * 100) if r["revenue"] else None
+            r["margin"] = (r["profit"] / r["revenue"] * 100) if (r["revenue"] and r["_n_sku_profit"] >= 3) else None
+            r["profit_is_stale"] = profit_stale or r["_n_sku_profit"] < 3
+            r.pop("_n_sku_profit", None)
+
         return {
             "date": date,
-            "revenue": round_n(total_rev, 0),
-            "profit": round_n(total_prof, 0),
-            "margin": round_n(total_prof / total_rev * 100, 2) if total_rev else None,
+            "revenue": round_n(revenue, 0) if revenue is not None else None,
+            "orders": int(orders) if orders is not None else None,
+            "profit": round_n(profit_total, 0) if profit_total is not None else None,
+            "profit_is_stale": profit_stale,
+            "margin": round_n(margin, 2) if margin is not None else None,
+            "margin_is_stale": profit_stale,
+            "source": "funnel+mpstats",
             "by_manager": {m: {
-                "revenue": round_n(v["revenue"], 0),
-                "profit": round_n(v["profit"], 0),
+                "revenue": round_n(v["revenue"], 0) if v["revenue"] else None,
+                "orders": int(v["orders"]) if v["orders"] else None,
+                "profit": round_n(v["profit"], 0) if v["profit"] else None,
                 "margin": round_n(v["margin"], 1) if v["margin"] is not None else None,
+                "profit_is_stale": v["profit_is_stale"],
             } for m, v in by_mgr.items()},
         }
 
-    return {"last": snapshot(last), "prev": snapshot(prev)}
+    return {
+        "last": snapshot(last_d),
+        "prev": snapshot(prev_d),
+        "mpstats_meta": {
+            "last_known_date": mpstats_last_date,
+            "today": today_str,
+            "days_behind": days_behind,
+            "is_stale": mpstats_is_stale,
+        },
+    }
 
 
 DAILY_FILES_FOR_HISTORY = {
@@ -711,8 +829,8 @@ def main():
     stars = compute_stars(sku_monthly)
     top_by_manager = compute_top_by_manager(sku_year, sku_monthly)
 
-    print("[7b] дневные данные (вчера/позавчера)...")
-    yesterday = parse_daily_yesterday(sku_monthly)
+    print("[7b] дневные данные из воронки + MPSTATS staleness...")
+    yesterday = parse_daily_yesterday(sku_monthly, plan_fact=plan_fact)
     if yesterday and yesterday.get("last"):
         print(f"        последний день в данных: {yesterday['last']['date']}")
 

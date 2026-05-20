@@ -6,16 +6,16 @@ applies_to:
 triggers:
   - operator: threshold
     metric: turnover
-    min: 120
+    max: 120     # matched, если turnover>120
 diagnostics:
   - operator: threshold
     metric: turnover
-    min: 180
+    max: 180     # matched, если turnover>180 (зона вывода)
     add_score: 30
     label: vyvod_zone
   - operator: threshold
     metric: margin
-    max: 15
+    min: 15      # matched, если margin<15 (низкая маржа усугубляет)
     add_score: 15
     label: low_margin
 action_lookup:

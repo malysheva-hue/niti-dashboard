@@ -13,11 +13,11 @@ triggers:
     min_change_pct: 30
   - operator: threshold
     metric: tacos
-    max: 3
+    min: 3     # matched, если tacos<3 (низкая нагрузка рекламы)
 diagnostics:
   - operator: threshold
     metric: margin
-    min: 25
+    max: 25    # matched, если margin>25 (есть запас)
     add_score: 10
     label: margin_capacity
 action_lookup:

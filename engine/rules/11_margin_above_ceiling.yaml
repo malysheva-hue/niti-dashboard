@@ -1,0 +1,25 @@
+id: MARGIN_ABOVE_CEILING
+description: Маржа выше верхней границы роли — резерв для роста (можно усиливать рекламу или снизить цену для разгона)
+severity_base: 40
+task_type: opportunity
+applies_to:
+  roles: [Локомотив, Маржинальный, База]
+  require_active: true
+triggers:
+  - operator: threshold
+    metric: margin
+    max: 40
+diagnostics:
+  - operator: threshold
+    metric: margin
+    max: 60
+    add_score: 15
+    label: ultra_high_margin
+action_lookup:
+  default: growth.scale_up
+  overrides:
+    - if_diagnostics_include: [ultra_high_margin]
+      action: growth.scale_up
+escalation:
+  red_threshold: 999
+  yellow_threshold: 0

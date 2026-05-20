@@ -32,11 +32,16 @@ def _problem_text(finding: Finding) -> str:
         td = finding.trigger_details.get("orders") or {}
         return phrases.render_phrase("problem_one_liner_order_drop",
                                      pct=td.get("pct", "—"), window=td.get("window", 7))
-    if rid == "MARGIN_ANOMALY":
+    if rid in ("MARGIN_ANOMALY", "MARGIN_BELOW_FLOOR"):
         return phrases.render_phrase("problem_one_liner_margin",
                                      value=round(m.get("margin") or 0, 1),
                                      min=norms.get("margin_min") or 20,
                                      role=role or "—")
+    if rid == "MARGIN_ABOVE_CEILING":
+        return phrases.render_phrase("growth_high_margin_low_ad",
+                                     sku=finding.sku_code,
+                                     manager=finding.manager,
+                                     margin=round(m.get("margin") or 0, 1))
     if rid == "DRR_RUNAWAY":
         return phrases.render_phrase("problem_one_liner_drr",
                                      value=round(m.get("drr") or 0, 1),

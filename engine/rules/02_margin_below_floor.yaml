@@ -1,0 +1,35 @@
+id: MARGIN_BELOW_FLOOR
+description: Маржа ниже минимально допустимой (matched when value < min)
+severity_base: 45
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
+  require_active: true
+triggers:
+  - operator: threshold
+    metric: margin
+    min: 20    # matched, если margin<20
+diagnostics:
+  - operator: threshold
+    metric: margin
+    min: 0     # matched, если margin<0 — убыточный
+    add_score: 60
+    label: negative_margin
+  - operator: threshold
+    metric: margin
+    min: 5     # matched, если margin<5 — критично низкая
+    add_score: 30
+    label: critically_low
+action_lookup:
+  default: margin.below_universal
+  overrides:
+    - if_diagnostics_include: [negative_margin]
+      action: margin.negative_urgent
+    - if_diagnostics_include: [critically_low]
+      action: margin.below_universal
+    - if_role_is: [Локомотив]
+      action: margin.below_role_lokomotiv
+    - if_role_is: [Маржинальный]
+      action: margin.below_role_marginal
+escalation:
+  red_threshold: 80
+  yellow_threshold: 60

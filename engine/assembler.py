@@ -71,9 +71,10 @@ def _problem_text(finding: Finding) -> str:
                                      window=7,
                                      min=td.get("min", "—"),
                                      max=td.get("max", "—"))
-    if rid == "HIGH_TURNOVER_LOW_PRICE":
-        turn = round(m.get("turnover") or 0)
-        return f"Товар уходит за {turn} дней при сниженной за 7 дней цене — спрос держит, можно вернуть цену."
+    if rid == "PRICE_DROP_NO_EFFECT":
+        return "Снизили цену за 7 дней — заказы не выросли, эффекта пока нет."
+    if rid == "SPP_DROP":
+        return "СПП от ВБ просела за 7 дней, конверсия упала. Алгоритм остудил карточку."
     if rid == "STAGNATION":
         turn = round(m.get("turnover") or 0)
         return f"Оборачиваемость {turn} дней — товар стоит, замораживает капитал."
@@ -94,6 +95,22 @@ def fmt_month_ru_genitive(month_str):
         return "месяц"
     names = ["", "январь","февраль","март","апрель","май","июнь","июль","август","сентябрь","октябрь","ноябрь","декабрь"]
     return names[m] if 1 <= m <= 12 else "месяц"
+
+
+# v2.2: склонения имён менеджеров для правильных русских конструкций
+MANAGER_GENITIVE = {"Виктория": "Виктории", "Настя": "Насти", "Владимир": "Владимира"}
+
+
+def _gen(name):
+    return MANAGER_GENITIVE.get(name, name)
+
+
+def _plural(n, one, few, many):
+    """1 приоритет / 2-4 приоритета / 5+ приоритетов."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11: return one
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14): return few
+    return many
 
 
 def _fmt_rub(v) -> str:
@@ -447,7 +464,29 @@ def render_company_summary(findings: list[Finding], data: dict) -> str:
         else:
             lines.append(f"К плану мая: {pace:.0f}% темпа, отстаём {gap_m} М до плана {plan_m} М.")
 
-    return "\n".join(lines)
+    # v2.2: краткие секции менеджеров в формате Антона
+    lines.append("")
+    icons = {"Виктория": "🟦", "Настя": "🟪", "Владимир": "🟧"}
+    for mgr in ctx.ACTIVE_MANAGERS:
+        mgr_findings = [f for f in findings if f.manager == mgr]
+        mgr_month = ((data.get("manager_monthly") or {}).get(current) or {}).get(mgr) or {}
+        plan_m_val = PLANS_BY_MGR.get(current, {}).get(mgr)
+        pace_m = None
+        if plan_m_val and mgr_month.get("revenue") and dim and dop:
+            expected = plan_m_val * dop / dim
+            pace_m = mgr_month["revenue"] / expected * 100 if expected else None
+        pace_str = f"{pace_m:.0f}%" if pace_m else "—"
+        rev_str = _fmt_rub(mgr_month.get("revenue"))
+        plan_str = _fmt_rub(plan_m_val) if plan_m_val else "—"
+        emoji = "✅" if (pace_m or 0) >= 100 else ("⚠️" if (pace_m or 0) < 85 else "")
+        lines.append(f"{icons.get(mgr, '')} {mgr} · темп {pace_str} {emoji}".strip())
+        lines.append(f"   {rev_str} ₽ при плане {plan_str} ₽")
+        if mgr_findings:
+            codes = ", ".join(f.sku_code for f in mgr_findings[:3])
+            lines.append(f"   В фокусе: {codes}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 def _get_plan_company(month: str) -> float | None:
@@ -503,8 +542,9 @@ def render_manager_block(manager: str, findings: list[Finding], data: dict) -> s
     if not mgr_findings:
         lines.append(phrases.render_phrase("manager_no_issues", manager=manager))
     else:
-        lines.append(phrases.render_phrase("manager_focus",
-                                           manager=manager, focus_count=len(mgr_findings)))
+        n = len(mgr_findings)
+        word = _plural(n, "приоритет", "приоритета", "приоритетов")
+        lines.append(f"У {_gen(manager)} {n} {word} на сегодня — все в списке.")
         # перечисление SKU в фокусе
         codes = ", ".join(f.sku_code for f in mgr_findings[:5])
         lines.append(f"В фокусе: {codes}.")

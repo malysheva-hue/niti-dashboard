@@ -858,11 +858,10 @@ def _compact_value(metric, v):
     return round(v, 1)
 
 
-def parse_daily_history(sku_monthly, current_month, window_days=14):
-    """v2.0: дневная история по 5 метрикам из data/history.parquet.
+def parse_daily_history(sku_monthly, current_month, window_days=30):
+    """v2.2: дневная история 30 дней (нужно для переключателя «30 дней» в модалке).
     Покрытие — все SKU из годового архива.
-    window_days=14 (хватает для changes 7d-vs-7d и спарклайнов).
-    Возвращает sku_history[code] = {dates, orders, price, spp, stock, profit}.
+    Возвращает sku_history[code] = {dates, orders, price, spp, stock, profit, drr, conv}.
     """
     pivot = _load_history_pivot(list(METRIC_TO_INDICATOR.values()))
     if not pivot:

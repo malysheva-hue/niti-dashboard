@@ -1,0 +1,22 @@
+id: SPP_DROP
+description: СПП от ВБ упала >10 пп И конверсия в заказ просела за 7 дней
+severity_base: 55
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
+  require_active: true
+triggers:
+  - operator: spp_drop_detected
+    metric: spp
+    window_days: 7
+    threshold_pp: 10
+  - operator: trend
+    metric: conv
+    window_days: 7
+    direction: down
+    min_change_pct: -20
+diagnostics: []
+action_lookup:
+  default: order_drop.spp_recovery
+escalation:
+  red_threshold: 80
+  yellow_threshold: 55

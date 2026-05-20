@@ -51,8 +51,43 @@ STAR_CODES = {"КЛ007", "КЛ003", "ЛК013", "ПВС002"}
 LOCO_RISK_CODES = {"ПС002", "ФМПНН0032", "ЮТ001", "ЮТ002"}
 ACTIVE_MANAGERS = {"Виктория", "Настя", "Владимир"}
 AI_SUMMARY_FILE = ROOT / "data" / "ai_summary.json"
-DAILY_REVENUE_FILE = CSV_DIR / "Дневная_Сумма_заказов.csv"
-DAILY_PROFIT_FILE = CSV_DIR / "Дневная_Прибыль.csv"
+DAILY_REVENUE_FILE = CSV_DIR / "Дневная_Сумма_заказов.csv"   # v2.0: legacy, не используется
+DAILY_PROFIT_FILE = CSV_DIR / "Дневная_Прибыль.csv"          # v2.0: legacy, не используется
+HISTORY_PARQUET = ROOT / "data" / "history.parquet"           # v2.0: годовая база
+
+
+def _load_history_pivot(indicators: list[str]) -> dict:
+    """v2.0: читает data/history.parquet, возвращает {indicator: {code: {date: value}}}.
+    Фильтрует только нужные показатели для экономии памяти.
+    """
+    if not HISTORY_PARQUET.exists():
+        return {}
+    try:
+        import pyarrow.parquet as pq
+        import pyarrow.compute as pc
+    except ImportError:
+        return {}
+    try:
+        t = pq.read_table(
+            HISTORY_PARQUET,
+            columns=["code", "indicator", "date", "value"],
+            filters=[("indicator", "in", indicators)],
+        )
+    except Exception:
+        t = pq.read_table(HISTORY_PARQUET,
+                          columns=["code", "indicator", "date", "value"])
+        mask = pc.is_in(t["indicator"], options=pc.SetLookupOptions(value_set=indicators))
+        t = t.filter(mask)
+    out = {}
+    codes = t["code"].to_pylist()
+    inds = t["indicator"].to_pylist()
+    dates = t["date"].to_pylist()
+    values = t["value"].to_pylist()
+    for c, i, d, v in zip(codes, inds, dates, values):
+        if v is None or c is None or i is None or d is None:
+            continue
+        out.setdefault(i, {}).setdefault(c, {})[str(d)] = float(v)
+    return out
 
 
 def num(v):
@@ -559,27 +594,18 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             if pu is not None:
                 profit_per_unit[code] = pu
 
-    # ДНЕВНАЯ прибыль/маржа/выручка из MPSTATS — сворачиваем все SKU по каждому дню.
-    # Источник «текущего» дня: новый план-факт (3 последних дня).
-    # История 30+ дней: Дневная_Прибыль/Сумма_заказов.csv из csv-year/.
+    # v2.0: дневная прибыль/выручка — из годового parquet (история) + текущий план-факт.
+    # csv-year/Дневная_*.csv больше не используем (топ-200 артикулов было ограничением).
     daily_mpstats_profit = {}
     daily_mpstats_revenue = {}
 
-    # 1. Историю из CSV (длинный формат)
-    def _read_long_csv(path):
-        out = {}
-        if not path.exists():
-            return out
-        with open(path, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                d = row.get("Дата")
-                v = num(row.get("Значение"))
-                if d and v is not None:
-                    out[d] = out.get(d, 0) + v
-        return out
-
-    daily_mpstats_profit.update(_read_long_csv(DAILY_PROFIT_FILE))
-    daily_mpstats_revenue.update(_read_long_csv(DAILY_REVENUE_FILE))
+    pivot = _load_history_pivot(["Прибыль, руб", "Сумма заказов, руб"])
+    for code_map in (pivot.get("Прибыль, руб") or {}).values():
+        for d, v in code_map.items():
+            daily_mpstats_profit[d] = daily_mpstats_profit.get(d, 0) + v
+    for code_map in (pivot.get("Сумма заказов, руб") or {}).values():
+        for d, v in code_map.items():
+            daily_mpstats_revenue[d] = daily_mpstats_revenue.get(d, 0) + v
 
     # 2. Свежие 3 дня из плана-факта — перебивают CSV
     if plan_fact:
@@ -800,64 +826,105 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
     }
 
 
-DAILY_FILES_FOR_HISTORY = {
-    "orders": "Дневная_Факт_заказов.csv",
-    "price": "Дневная_Цена_после_СПП.csv",
-    "spp": "Дневная_СПП.csv",
-    "stock": "Дневная_Остаток.csv",
-    "profit": "Дневная_Прибыль.csv",
+METRIC_TO_INDICATOR = {
+    "orders":  "Факт заказов, шт",
+    "price":   "Цена после СПП",
+    "spp":     "СПП",
+    "stock":   "Остаток",
+    "profit":  "Прибыль, руб",
 }
 
 
-def parse_daily_history(sku_monthly, current_month, max_sku=None):
-    """30-дневная история по 5 метрикам для всех SKU из месячного среза.
-    Включаются:
-      - SKU с любыми заказами в текущем месяце ИЛИ
-      - звёзды и топ-локомотивы всегда.
-    SKU без активности и без истории просто не получат записи на выходе
-    (any_data=False внутри функции).
+_INT_METRICS = {"orders", "stock"}
 
-    max_sku: если задан — отрезает по топ-N выручки.
+
+def _compact_value(metric, v):
+    if v is None:
+        return None
+    if metric in _INT_METRICS:
+        return int(round(v))
+    return round(v, 1)
+
+
+def parse_daily_history(sku_monthly, current_month, window_days=14):
+    """v2.0: дневная история по 5 метрикам из data/history.parquet.
+    Покрытие — все SKU из годового архива.
+    window_days=14 (хватает для changes 7d-vs-7d и спарклайнов).
+    Возвращает sku_history[code] = {dates, orders, price, spp, stock, profit}.
     """
-    if current_month not in sku_monthly:
+    pivot = _load_history_pivot(list(METRIC_TO_INDICATOR.values()))
+    if not pivot:
         return {}
-    # v1.9: включаем ВСЕХ из месячного среза, фильтрация по any_data произойдёт ниже
-    rows = list(sku_monthly[current_month])
-    rows.sort(key=lambda r: r.get("revenue", 0) or 0, reverse=True)
-    if max_sku:
-        rows = rows[:max_sku]
-    target_codes = {r["code"] for r in rows if r.get("code")}
-    target_codes |= STAR_CODES | LOCO_RISK_CODES
 
-    series = {k: {} for k in DAILY_FILES_FOR_HISTORY}
     all_dates = set()
-    for metric, fname in DAILY_FILES_FOR_HISTORY.items():
-        path = CSV_DIR / fname
-        if not path.exists():
-            continue
-        with open(path, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                code = row.get("Артикул поставщика")
-                if not code or code not in target_codes:
-                    continue
-                date = row.get("Дата")
-                v = num(row.get("Значение"))
-                if not date or v is None:
-                    continue
-                series[metric].setdefault(code, {})[date] = v
-                all_dates.add(date)
+    for ind in METRIC_TO_INDICATOR.values():
+        for code_map in (pivot.get(ind) or {}).values():
+            all_dates.update(code_map.keys())
+    dates_n = sorted(all_dates, key=_date_key)[-window_days:]
 
-    dates_30 = sorted(all_dates, key=_date_key)[-30:]
+    all_codes = set()
+    for ind in METRIC_TO_INDICATOR.values():
+        all_codes.update((pivot.get(ind) or {}).keys())
+    all_codes |= STAR_CODES | LOCO_RISK_CODES
+
     out = {}
-    for code in target_codes:
-        per = {"dates": dates_30}
+    for code in all_codes:
+        per = {"dates": dates_n}
         any_data = False
-        for metric in DAILY_FILES_FOR_HISTORY:
-            row = series[metric].get(code, {})
-            arr = [row.get(d) for d in dates_30]
+        for metric, ind in METRIC_TO_INDICATOR.items():
+            code_map = (pivot.get(ind) or {}).get(code, {})
+            arr = [_compact_value(metric, code_map.get(d)) for d in dates_n]
             per[metric] = arr
             if any(v is not None for v in arr):
                 any_data = True
+        if any_data:
+            out[code] = per
+    return out
+
+
+def parse_monthly_history(window_months=12):
+    """v2.0: помесячные агрегаты для графика «12 месяцев» в модалке SKU."""
+    pivot = _load_history_pivot(["Факт заказов, шт", "Сумма заказов, руб", "Прибыль, руб"])
+    if not pivot:
+        return {}
+
+    def month_of(date_str):
+        try:
+            d, m, y = date_str.split(".")
+            return f"{y}-{m}"
+        except Exception:
+            return None
+
+    all_months = set()
+    for ind in ("Факт заказов, шт", "Сумма заказов, руб", "Прибыль, руб"):
+        for code_map in (pivot.get(ind) or {}).values():
+            for d in code_map.keys():
+                m = month_of(d)
+                if m:
+                    all_months.add(m)
+    months_sorted = sorted(all_months)[-window_months:]
+
+    all_codes = set()
+    for ind in ("Факт заказов, шт", "Сумма заказов, руб", "Прибыль, руб"):
+        all_codes.update((pivot.get(ind) or {}).keys())
+
+    out = {}
+    for code in all_codes:
+        per = {"months": months_sorted, "orders": [], "revenue": [], "profit": []}
+        any_data = False
+        for m in months_sorted:
+            for metric, ind in (("orders", "Факт заказов, шт"),
+                                ("revenue", "Сумма заказов, руб"),
+                                ("profit", "Прибыль, руб")):
+                code_map = (pivot.get(ind) or {}).get(code, {})
+                total = sum(v for d, v in code_map.items() if month_of(d) == m and v is not None)
+                # сжатие: orders как int, revenue/profit в ТЫСЯЧАХ для экономии места
+                if metric == "orders":
+                    per[metric].append(int(round(total)) if total else 0)
+                else:
+                    per[metric].append(int(round(total / 1000)) if total else 0)
+                if total:
+                    any_data = True
         if any_data:
             out[code] = per
     return out
@@ -987,9 +1054,17 @@ def main():
     if yesterday and yesterday.get("last"):
         print(f"        последний день в данных: {yesterday['last']['date']}")
 
-    print("[7c] 30-дневная история для всех active SKU...")
+    print("[7c] 30-дневная история из history.parquet...")
     sku_history = parse_daily_history(sku_monthly, DEFAULT_MONTH)
-    print(f"        SKU в истории: {len(sku_history)}")
+    print(f"        SKU в дневной истории: {len(sku_history)}")
+
+    print("[7c.2] 12-месячная история для модалок SKU...")
+    sku_history_monthly_full = parse_monthly_history(window_months=12)
+    # Ужимаем: оставляем только SKU из текущего месячного среза (1003), +звёзды/локо
+    active_codes = {r["code"] for r in sku_monthly.get(DEFAULT_MONTH, []) if r.get("code")}
+    active_codes |= STAR_CODES | LOCO_RISK_CODES
+    sku_history_monthly = {c: v for c, v in sku_history_monthly_full.items() if c in active_codes}
+    print(f"        SKU в месячной истории (после фильтрации active): {len(sku_history_monthly)}")
 
     # v1.9: coverage-лог по текущему месяцу
     month_rows = sku_monthly.get(DEFAULT_MONTH, []) or []
@@ -1050,6 +1125,7 @@ def main():
         "funnels": funnels,
         "yesterday": yesterday,
         "sku_history": sku_history,
+        "sku_history_monthly": sku_history_monthly,
         "ai_summary": ai_summary,
         "daily_summary_md": summary_md,
     }

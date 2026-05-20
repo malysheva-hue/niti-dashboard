@@ -14,6 +14,7 @@ data/Сжатые файлы НТ год/
 data/*.md
 data/*.xlsx
 data/ai_summary.json
+data/history.parquet
 
 # Артефакты
 *.xlsx

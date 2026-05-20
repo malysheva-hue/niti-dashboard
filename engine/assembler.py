@@ -322,15 +322,48 @@ def _star_tempo(cur_revenue, prev_revenue, target_growth_pct, month_str):
     return cur_revenue / expected * 100
 
 
-def _fmt_pct_delta(curr, prev):
+def _month_days(month_str):
+    """Возвращает (days_in_month, days_passed) для месяца, иначе (None, None)."""
+    if not month_str:
+        return (None, None)
+    from datetime import date as _date
+    try:
+        y, m = (int(x) for x in month_str.split("-"))
+    except (ValueError, TypeError):
+        return (None, None)
+    dim = (_date(y if m < 12 else y + 1, (m % 12) + 1, 1) - _date(y, m, 1)).days
+    today = _date.today()
+    if today.year == y and today.month == m:
+        dop = today.day
+    elif today > _date(y, m, dim):
+        dop = dim
+    else:
+        dop = 0
+    return (dim, dop)
+
+
+def _fmt_pct_delta(curr, prev, current_month=None):
+    """MoM-дельта с pro-rata коррекцией для неполного месяца.
+
+    Если current_month неполный (dop<dim), сравниваем не «весь curr vs весь prev»,
+    а projected_full_month = curr × dim/dop, чтобы не показывать ложное падение
+    в начале месяца. К строке добавляется пометка «(прогноз на 31/31)».
+    """
     if curr is None or prev is None or prev == 0:
         return None
+    dim, dop = _month_days(current_month) if current_month else (None, None)
+    if dim and dop and dop < dim:
+        projected = curr * dim / dop
+        pct = (projected - prev) / abs(prev) * 100
+        sign = "+" if pct >= 0 else ""
+        return f"{sign}{pct:.0f}% (прогноз на {dim}/{dim} дн)"
     pct = (curr - prev) / abs(prev) * 100
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:.0f}%"
 
 
 def _fmt_pp_delta(curr, prev):
+    """Pp-дельта для маржи (не зависит от длины месяца — это уже %)."""
     if curr is None or prev is None:
         return None
     delta = curr - prev
@@ -434,9 +467,9 @@ def render_stars_status(data: dict) -> list[dict]:
                 "tempo_pct": round(tempo) if tempo is not None else None,
             },
             "delta_vs_prev_month": {
-                "revenue": _fmt_pct_delta(cur.get("revenue"), prv.get("revenue")),
+                "revenue": _fmt_pct_delta(cur.get("revenue"), prv.get("revenue"), current),
                 "margin": _fmt_pp_delta(cur.get("margin"), prv.get("margin")),
-                "orders": _fmt_pct_delta(cur_full.get("orders"), prv_full.get("orders")),
+                "orders": _fmt_pct_delta(cur_full.get("orders"), prv_full.get("orders"), current),
             },
         })
     return out

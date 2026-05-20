@@ -640,6 +640,7 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
     # импорт оператора для аномалий
     from engine.operators import compute_anomaly_mad
     from engine.contexts import ANOMALY_RULES
+    from datetime import timedelta as _td
 
     def history_for(date_str, metric_dict):
         """Возвращает значения metric за 7 закрытых дней до date_str
@@ -660,6 +661,87 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
         # последние 7 закрытых
         return [v for v in result[-ANOMALY_RULES["window_days"]:] if v is not None]
 
+    # Маржа дневная: считаем по всем закрытым дням
+    margin_history_dict = {k: margin_for_day(k) for k in daily_mpstats_revenue
+                           if margin_for_day(k) is not None}
+
+    # v1.6: предрасчёт is_anomaly для ВСЕХ дней (нужно для make_display).
+    # Для подмены отображения берём только sign_flip (реальный шум разноски),
+    # mad_outlier не блокирует — это просто широкая дисперсия,
+    # а не противоречие медиане.
+    profit_anomaly_by_date = {}
+    margin_anomaly_by_date = {}
+    for d in daily_mpstats_profit.keys():
+        h = history_for(d, daily_mpstats_profit)
+        r = compute_anomaly_mad(daily_mpstats_profit[d], h,
+                                mad_multiplier=ANOMALY_RULES["mad_multiplier"])
+        profit_anomaly_by_date[d] = (r["reason"] == "sign_flip")
+    for d in margin_history_dict.keys():
+        h = history_for(d, margin_history_dict)
+        r = compute_anomaly_mad(margin_history_dict[d], h,
+                                mad_multiplier=ANOMALY_RULES["mad_multiplier"])
+        margin_anomaly_by_date[d] = (r["reason"] == "sign_flip")
+
+    def make_display(reference_date, values_dict, anomaly_flags, current_month_suffix):
+        """v1.6: вернуть display-структуру для метрики.
+
+        - если reference_date чистый → берём её
+        - иначе ищем последний чистый день в окне 5 дней назад
+        - month_avg по чистым дням текущего месяца
+        - missing_dates: грязные дни между display и reference_date
+        """
+        def is_clean(d):
+            return (d in values_dict
+                    and not anomaly_flags.get(d, False)
+                    and not mpstats_is_stale)
+
+        display = None
+        if is_clean(reference_date):
+            display = reference_date
+        else:
+            try:
+                ref_dt = _d(*_date_key(reference_date))
+            except Exception:
+                return None
+            for back in range(1, 6):
+                d_dt = ref_dt - _td(days=back)
+                d_str = d_dt.strftime("%d.%m.%Y")
+                if is_clean(d_str):
+                    display = d_str
+                    break
+        if display is None:
+            return None
+
+        display_value = values_dict.get(display)
+        substituted = (display != reference_date)
+
+        # средняя по чистым дням текущего месяца
+        clean_in_month = [d for d in sorted(values_dict.keys(), key=_date_key)
+                          if d.endswith(current_month_suffix) and is_clean(d)]
+        month_values = [values_dict[d] for d in clean_in_month]
+        month_avg = sum(month_values) / len(month_values) if month_values else None
+
+        # missing — грязные дни между display и reference_date включительно
+        missing = []
+        try:
+            ref_key = _date_key(reference_date)
+            disp_key = _date_key(display)
+            for d in sorted(values_dict.keys(), key=_date_key):
+                dk = _date_key(d)
+                if dk > disp_key and dk <= ref_key and not is_clean(d):
+                    missing.append(d)
+        except Exception:
+            pass
+
+        return {
+            "value": round_n(display_value, 2),
+            "date": display,
+            "substituted": substituted,
+            "month_avg": round_n(month_avg, 2) if month_avg is not None else None,
+            "month_days_used": len(clean_in_month),
+            "missing_dates": missing,
+        }
+
     def snapshot(date):
         if date is None:
             return None
@@ -667,23 +749,23 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
         revenue = f.get("revenue")
         orders = f.get("orders")
 
-        # v1.5: прибыль/маржа берём НАПРЯМУЮ из дневной разноски MPSTATS
+        # v1.5: прибыль/маржа из дневной разноски MPSTATS
         profit_total = daily_mpstats_profit.get(date)
         margin_val = margin_for_day(date)
-
         profit_stale = mpstats_is_stale or profit_total is None
 
-        # AnomalyDetect для прибыли
+        # AnomalyDetect для отображения / истории
         prof_hist = history_for(date, daily_mpstats_profit)
         prof_anom = compute_anomaly_mad(profit_total, prof_hist,
                                         mad_multiplier=ANOMALY_RULES["mad_multiplier"])
-
-        # Маржа дневная: считаем по всем закрытым дням и определяем аномалию
-        margin_history_dict = {k: margin_for_day(k) for k in daily_mpstats_revenue
-                               if margin_for_day(k) is not None}
         marg_hist = history_for(date, margin_history_dict)
         marg_anom = compute_anomaly_mad(margin_val, marg_hist,
                                         mad_multiplier=ANOMALY_RULES["mad_multiplier"])
+
+        # v1.6: display-структуры для UI (подмена грязного дня)
+        month_suffix = "." + ".".join(date.split(".")[1:]) if date else ""
+        profit_display = make_display(date, daily_mpstats_profit, profit_anomaly_by_date, month_suffix)
+        margin_display = make_display(date, margin_history_dict, margin_anomaly_by_date, month_suffix)
 
         # Разбивка по менеджеру: используем voronka.orders по SKU + profit_per_unit
         # как фолбэк (на уровне менеджера дневной MPSTATS-профит не очень информативен).
@@ -710,14 +792,17 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             "date": date,
             "revenue": round_n(revenue, 0) if revenue is not None else None,
             "orders": int(orders) if orders is not None else None,
-            "profit": round_n(profit_total, 0) if profit_total is not None else None,
+            # v1.6: сырая прибыль/маржа сохраняются для диагностики, UI читает *_display
+            "profit_raw": round_n(profit_total, 0) if profit_total is not None else None,
+            "margin_raw": round_n(margin_val, 2) if margin_val is not None else None,
             "profit_is_stale": profit_stale,
             "profit_is_anomaly": prof_anom["is_anomaly"],
             "profit_anomaly_meta": prof_anom,
-            "margin": round_n(margin_val, 2) if margin_val is not None else None,
             "margin_is_stale": profit_stale,
             "margin_is_anomaly": marg_anom["is_anomaly"],
             "margin_anomaly_meta": marg_anom,
+            "profit_display": profit_display,
+            "margin_display": margin_display,
             "source": "funnel+mpstats",
             "by_manager": {m: {
                 "revenue": round_n(v["revenue"], 0) if v["revenue"] else None,

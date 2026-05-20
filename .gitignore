@@ -1,0 +1,23 @@
+# Локальные источники данных
+inputs/
+data/csv-year/
+data/inputs/
+data/processed/
+
+# Локальные xlsx-папки (история)
+data/Воронка ВБ 2025-2026/
+data/Не сжатые/
+data/Не сждатые файлы НТ год/
+data/Сжатые файлы НТ год/
+
+# Локальные md/xlsx внутри data
+data/*.md
+data/*.xlsx
+
+# Артефакты
+*.xlsx
+*.parquet
+*.log
+__pycache__/
+.DS_Store
+.venv/

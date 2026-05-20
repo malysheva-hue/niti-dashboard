@@ -508,6 +508,113 @@ def is_in_loco_risk_list(code: str):
 
 
 # ============================================================
+# ANOMALY DETECTION (v1.5) — MAD-based outlier для прибыли/маржи
+# ============================================================
+def _median(values):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return None
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def median_mad(values):
+    """Median + MAD (median absolute deviation) для списка чисел.
+
+    Возвращает (median, mad). Если данных <3 — (None, None).
+    MAD устойчивее std к одиночным выбросам, что и нужно для шумных
+    дней с разноской.
+
+    Пример: median_mad([100,120,110,130,90,200,−50]) → (110, 20).
+    """
+    clean = [v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if len(clean) < 3:
+        return (None, None)
+    med = _median(clean)
+    deviations = [abs(v - med) for v in clean]
+    mad = _median(deviations)
+    return (med, mad)
+
+
+def compute_anomaly_mad(day_value, history_values, mad_multiplier: float = 3.0):
+    """Определяет, является ли day_value аномалией относительно history_values.
+
+    Правила (любое срабатывает):
+      1) sign_flip — знак противоположен медиане истории
+      2) mad_outlier — |day_value − median| > mad_multiplier × MAD
+
+    Возвращает dict:
+      {"is_anomaly": bool, "median": float|None, "mad": float|None,
+       "reason": str|None, "n_history": int}
+
+    Пример: compute_anomaly_mad(-67198, [193000,210000,205000,180000,
+                                         215000,170000,225000], 3)
+        → {is_anomaly: True, reason: "sign_flip", median: 205000, ...}
+    """
+    clean_history = [v for v in (history_values or [])
+                     if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    n = len(clean_history)
+    if day_value is None or n < 3:
+        return {"is_anomaly": False, "median": None, "mad": None,
+                "reason": None, "n_history": n}
+    med, mad = median_mad(clean_history)
+    if med is None:
+        return {"is_anomaly": False, "median": None, "mad": None,
+                "reason": None, "n_history": n}
+    # 1. sign_flip
+    if (med > 0 and day_value < 0) or (med < 0 and day_value > 0):
+        return {"is_anomaly": True, "median": round(med, 2),
+                "mad": round(mad, 2) if mad is not None else None,
+                "reason": "sign_flip", "n_history": n}
+    # 2. mad_outlier
+    if mad is not None and mad > 0:
+        if abs(day_value - med) > mad_multiplier * mad:
+            return {"is_anomaly": True, "median": round(med, 2),
+                    "mad": round(mad, 2),
+                    "reason": "mad_outlier", "n_history": n}
+    return {"is_anomaly": False, "median": round(med, 2),
+            "mad": round(mad, 2) if mad is not None else None,
+            "reason": None, "n_history": n}
+
+
+def consecutive_days(series_with_flags, predicate, n_required: int = 3):
+    """Считает максимальный стрик подряд идущих дней удовлетворяющих predicate,
+    ПРОПУСКАЯ дни с is_anomaly=True (они не разрывают стрик и не учитываются).
+
+    series_with_flags: list of dicts [{"value": v, "is_anomaly": bool}, ...]
+    predicate: callable(value) → bool
+
+    matched=True если найден стрик ≥ n_required.
+
+    Пример: ДРР>10 три дня подряд при пропуске аномалий →
+        consecutive_days([{value:12,is_anomaly:False},
+                          {value:11,is_anomaly:False},
+                          {value:99,is_anomaly:True},
+                          {value:11,is_anomaly:False}],
+                         lambda v: v>10, 3) → matched=True
+    """
+    streak = 0
+    max_streak = 0
+    for point in series_with_flags or []:
+        if point.get("is_anomaly"):
+            continue  # пропускаем, не разрываем
+        v = point.get("value")
+        if v is None:
+            streak = 0
+            continue
+        if predicate(v):
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    matched = max_streak >= n_required
+    return OpResult(matched, min(100, max_streak * 20),
+                    {"max_streak": max_streak, "required": n_required})
+
+
+# ============================================================
 # Реестр операторов — для YAML rule_loader
 # ============================================================
 OPERATORS = {
@@ -542,4 +649,6 @@ OPERATORS = {
     "is_seasonal": is_seasonal,
     "is_in_stars_list": is_in_stars_list,
     "is_in_loco_risk_list": is_in_loco_risk_list,
+    # anomaly
+    "consecutive_days": consecutive_days,
 }

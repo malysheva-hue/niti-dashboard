@@ -547,19 +547,79 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             if pu is not None:
                 profit_per_unit[code] = pu
 
-    # mpstats_last_date: на какую дату есть данные в plan_fact
-    mpstats_last_date = None
+    # ДНЕВНАЯ прибыль/маржа/выручка из MPSTATS — сворачиваем все SKU по каждому дню.
+    # Источник «текущего» дня: новый план-факт (3 последних дня).
+    # История 30+ дней: Дневная_Прибыль/Сумма_заказов.csv из csv-year/.
+    daily_mpstats_profit = {}
+    daily_mpstats_revenue = {}
+
+    # 1. Историю из CSV (длинный формат)
+    def _read_long_csv(path):
+        out = {}
+        if not path.exists():
+            return out
+        with open(path, encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                d = row.get("Дата")
+                v = num(row.get("Значение"))
+                if d and v is not None:
+                    out[d] = out.get(d, 0) + v
+        return out
+
+    daily_mpstats_profit.update(_read_long_csv(DAILY_PROFIT_FILE))
+    daily_mpstats_revenue.update(_read_long_csv(DAILY_REVENUE_FILE))
+
+    # 2. Свежие 3 дня из плана-факта — перебивают CSV
     if plan_fact:
-        # перебираем дневные значения «Сумма заказов, руб» — берём max дату где значение !=0/None
+        # сначала найдём какие дни есть в плане-факте с данными
         for code, indicators in plan_fact.items():
+            prof_ind = indicators.get("Прибыль, руб") or {}
             rev_ind = indicators.get("Сумма заказов, руб") or {}
+            for k, v in prof_ind.items():
+                if k == "totals":
+                    continue
+                if isinstance(v, (int, float)):
+                    # помечаем что для этого дня есть свежие данные → накопим заново
+                    pass
+        # двухэтапная сборка: ключи где есть план-факт → пересобрать с нуля
+        pf_days_profit = set()
+        pf_days_revenue = set()
+        new_profit = {}
+        new_revenue = {}
+        for code, indicators in plan_fact.items():
+            prof_ind = indicators.get("Прибыль, руб") or {}
+            rev_ind = indicators.get("Сумма заказов, руб") or {}
+            for k, v in prof_ind.items():
+                if k == "totals":
+                    continue
+                if isinstance(v, (int, float)):
+                    pf_days_profit.add(k)
+                    new_profit[k] = new_profit.get(k, 0) + v
             for k, v in rev_ind.items():
                 if k == "totals":
                     continue
-                # k — это "01.05.2026"
-                if v and isinstance(v, (int, float)) and v > 0:
-                    if mpstats_last_date is None or _date_key(k) > _date_key(mpstats_last_date):
-                        mpstats_last_date = k
+                if isinstance(v, (int, float)):
+                    pf_days_revenue.add(k)
+                    new_revenue[k] = new_revenue.get(k, 0) + v
+        # перекрываем csv данными плана-факта по тем дням, где они есть
+        for k in pf_days_profit:
+            daily_mpstats_profit[k] = new_profit[k]
+        for k in pf_days_revenue:
+            daily_mpstats_revenue[k] = new_revenue[k]
+
+    def margin_for_day(date_str):
+        r = daily_mpstats_revenue.get(date_str) or 0
+        p = daily_mpstats_profit.get(date_str)
+        if not r or p is None:
+            return None
+        return p / r * 100
+
+    # mpstats_last_date — последний день с реальной разноской
+    mpstats_last_date = None
+    for k, v in daily_mpstats_revenue.items():
+        if v and v > 0:
+            if mpstats_last_date is None or _date_key(k) > _date_key(mpstats_last_date):
+                mpstats_last_date = k
     today_str = _d.today().strftime("%d.%m.%Y")
     if mpstats_last_date:
         days_behind = (_d.today() - _d(_date_key(mpstats_last_date)[0],
@@ -577,6 +637,29 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             if c and m and c not in code_to_manager:
                 code_to_manager[c] = m
 
+    # импорт оператора для аномалий
+    from engine.operators import compute_anomaly_mad
+    from engine.contexts import ANOMALY_RULES
+
+    def history_for(date_str, metric_dict):
+        """Возвращает значения metric за 7 закрытых дней до date_str
+        (не сегодня, не сам день)."""
+        if not date_str:
+            return []
+        all_dates_sorted = sorted(metric_dict.keys(), key=_date_key)
+        target_key = _date_key(date_str)
+        today_key = (_d.today().year, _d.today().month, _d.today().day)
+        result = []
+        for k in all_dates_sorted:
+            kk = _date_key(k)
+            if kk >= target_key:
+                continue
+            if kk >= today_key:
+                continue
+            result.append(metric_dict.get(k))
+        # последние 7 закрытых
+        return [v for v in result[-ANOMALY_RULES["window_days"]:] if v is not None]
+
     def snapshot(date):
         if date is None:
             return None
@@ -584,27 +667,28 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
         revenue = f.get("revenue")
         orders = f.get("orders")
 
-        # прибыль через profit_per_unit × orders_sku
-        by_sku = funnels_by_sku.get(date, {})
-        profit_total = None
-        if by_sku and profit_per_unit:
-            acc = 0.0
-            counted = 0
-            for code, vals in by_sku.items():
-                pu = profit_per_unit.get(code)
-                o = vals.get("orders") or 0
-                if pu is not None and o > 0:
-                    acc += pu * o
-                    counted += 1
-            if counted >= 5:
-                profit_total = acc
-        # is_stale: либо MPSTATS отстал, либо прибыль не вычислилась
+        # v1.5: прибыль/маржа берём НАПРЯМУЮ из дневной разноски MPSTATS
+        profit_total = daily_mpstats_profit.get(date)
+        margin_val = margin_for_day(date)
+
         profit_stale = mpstats_is_stale or profit_total is None
 
-        margin = (profit_total / revenue * 100) if (revenue and profit_total is not None) else None
+        # AnomalyDetect для прибыли
+        prof_hist = history_for(date, daily_mpstats_profit)
+        prof_anom = compute_anomaly_mad(profit_total, prof_hist,
+                                        mad_multiplier=ANOMALY_RULES["mad_multiplier"])
 
-        # разбивка по менеджеру: воронка по SKU → join manager
-        by_mgr = {m: {"revenue": 0.0, "orders": 0.0, "profit": 0.0, "_n_sku_profit": 0} for m in ACTIVE_MANAGERS}
+        # Маржа дневная: считаем по всем закрытым дням и определяем аномалию
+        margin_history_dict = {k: margin_for_day(k) for k in daily_mpstats_revenue
+                               if margin_for_day(k) is not None}
+        marg_hist = history_for(date, margin_history_dict)
+        marg_anom = compute_anomaly_mad(margin_val, marg_hist,
+                                        mad_multiplier=ANOMALY_RULES["mad_multiplier"])
+
+        # Разбивка по менеджеру: используем voronka.orders по SKU + profit_per_unit
+        # как фолбэк (на уровне менеджера дневной MPSTATS-профит не очень информативен).
+        by_sku = funnels_by_sku.get(date, {})
+        by_mgr = {m: {"revenue": 0.0, "orders": 0.0, "profit": 0.0, "_n": 0} for m in ACTIVE_MANAGERS}
         for code, vals in by_sku.items():
             mgr = code_to_manager.get(code)
             if mgr not in by_mgr:
@@ -615,12 +699,12 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             o = vals.get("orders") or 0
             if pu is not None and o > 0:
                 by_mgr[mgr]["profit"] += pu * o
-                by_mgr[mgr]["_n_sku_profit"] += 1
+                by_mgr[mgr]["_n"] += 1
         for mgr in by_mgr:
             r = by_mgr[mgr]
-            r["margin"] = (r["profit"] / r["revenue"] * 100) if (r["revenue"] and r["_n_sku_profit"] >= 3) else None
-            r["profit_is_stale"] = profit_stale or r["_n_sku_profit"] < 3
-            r.pop("_n_sku_profit", None)
+            r["margin"] = (r["profit"] / r["revenue"] * 100) if (r["revenue"] and r["_n"] >= 3) else None
+            r["profit_is_stale"] = profit_stale or r["_n"] < 3
+            r.pop("_n", None)
 
         return {
             "date": date,
@@ -628,8 +712,12 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             "orders": int(orders) if orders is not None else None,
             "profit": round_n(profit_total, 0) if profit_total is not None else None,
             "profit_is_stale": profit_stale,
-            "margin": round_n(margin, 2) if margin is not None else None,
+            "profit_is_anomaly": prof_anom["is_anomaly"],
+            "profit_anomaly_meta": prof_anom,
+            "margin": round_n(margin_val, 2) if margin_val is not None else None,
             "margin_is_stale": profit_stale,
+            "margin_is_anomaly": marg_anom["is_anomaly"],
+            "margin_anomaly_meta": marg_anom,
             "source": "funnel+mpstats",
             "by_manager": {m: {
                 "revenue": round_n(v["revenue"], 0) if v["revenue"] else None,

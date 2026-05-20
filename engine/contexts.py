@@ -151,6 +151,18 @@ def get_seasonal_phase(category: str, ref_date: date) -> str:
     return "normal"
 
 
+# ============================================================
+# ANOMALY_RULES — настройки детектора шумных дней
+# ============================================================
+ANOMALY_RULES = {
+    "window_days": 7,                  # сколько закрытых дней брать для базы
+    "mad_multiplier": 3,                # порог в MAD
+    "applies_to_metrics": ["profit", "margin"],   # только эти метрики
+    "applies_to_sources": ["mpstats"],            # не для воронки
+    "min_history_points": 3,                      # без 3+ точек медиана недостоверна
+}
+
+
 def role_of(group: str) -> str:
     """Маппинг группы товара в методологическую роль.
 

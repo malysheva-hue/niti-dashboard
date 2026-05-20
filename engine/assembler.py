@@ -78,6 +78,18 @@ def _problem_text(finding: Finding) -> str:
     return f"{finding.rule_id}"
 
 
+def fmt_month_ru_genitive(month_str):
+    """'2026-05' → 'май'."""
+    if not month_str:
+        return "месяц"
+    try:
+        m = int(month_str.split("-")[1])
+    except Exception:
+        return "месяц"
+    names = ["", "январь","февраль","март","апрель","май","июнь","июль","август","сентябрь","октябрь","ноябрь","декабрь"]
+    return names[m] if 1 <= m <= 12 else "месяц"
+
+
 def _fmt_rub(v) -> str:
     if v is None:
         return "—"
@@ -140,7 +152,7 @@ def _build_changes(sku: dict) -> list[dict]:
         if prev7 is not None and last7 is not None and prev7 > 0:
             dp = _delta_pct(prev7, last7)
             changes.append({
-                "label": "Цена после СПП",
+                "label": "Цена для покупателя",
                 "from": round(prev7, 0),
                 "to": round(last7, 0),
                 "delta_pct": round(dp, 1),
@@ -153,15 +165,30 @@ def _build_changes(sku: dict) -> list[dict]:
     if len(stock) >= 14:
         prev_val = stock[-8] if len(stock) >= 8 and stock[-8] is not None else None
         last_val = stock[-1] if stock and stock[-1] is not None else None
-        if prev_val and last_val is not None:
+        if prev_val is not None and last_val is not None:
             dp = _delta_pct(prev_val, last_val)
+            # v1.9: цвет остатка — НЕ по знаку, а по дням до нуля на складе.
+            # Velocity берём из последних 7 дней заказов.
+            last7_orders = [o for o in (orders[-7:] if orders else []) if o is not None]
+            velocity = sum(last7_orders) / len(last7_orders) if last7_orders else None
+            days_to_zero = (last_val / velocity) if (velocity and velocity > 0) else None
+            # bad/good
+            if days_to_zero is not None and days_to_zero < 7:
+                is_bad = True
+            elif days_to_zero is not None and days_to_zero > 14 and (dp or 0) < 0:
+                is_bad = False   # падает — но запас на 14+ дней есть
+            elif (dp or 0) > 0 and last7_orders and velocity is not None and velocity < 1:
+                is_bad = True    # растёт остаток, заказы стоят → залёг
+            else:
+                is_bad = False
             changes.append({
                 "label": "Остаток",
                 "from": int(prev_val),
                 "to": int(last_val),
                 "delta_pct": round(dp, 1) if dp is not None else None,
                 "delta_dir": "up" if (dp or 0) > 0 else "down" if (dp or 0) < 0 else "flat",
-                "is_bad": dp is not None and dp < -20,
+                "is_bad": is_bad,
+                "days_to_zero": round(days_to_zero, 1) if days_to_zero is not None else None,
                 "unit": "шт",
             })
 
@@ -267,8 +294,11 @@ def render_company_summary(findings: list[Finding], data: dict) -> str:
             expected = plan_company * dop / dim
             pace = cur["revenue"] / expected * 100 if expected else None
 
-    margin_target = 28.5
-    drr_target = 5.5
+    # v1.9: убраны захардкоженные цели. Если targets есть в data — используем,
+    # иначе просто показываем факт.
+    company_targets = data.get("company_targets") or {}
+    margin_target = company_targets.get("margin_target")
+    drr_target = company_targets.get("drr_target")
 
     red_n = sum(1 for f in findings if f.priority == "red")
     yellow_n = sum(1 for f in findings if f.priority == "yellow" and f.task_type == "risk")
@@ -305,23 +335,31 @@ def render_company_summary(findings: list[Finding], data: dict) -> str:
             key = "company_pace_weak"
         lines.append(phrases.render_phrase(key, pace=round(pace), days_passed=dop, days_in_month=dim))
 
-    # 3. Маржа
+    # 3. Маржа — без выдуманных целей
     if cur.get("margin") is not None:
-        gap = margin_target - cur["margin"]
-        if cur["margin"] >= margin_target - 1:
-            lines.append(phrases.render_phrase("company_margin_ok", value=round(cur["margin"], 1), target=margin_target))
+        if margin_target is not None:
+            gap = margin_target - cur["margin"]
+            if cur["margin"] >= margin_target - 1:
+                lines.append(phrases.render_phrase("company_margin_ok", value=round(cur["margin"], 1), target=margin_target))
+            else:
+                lines.append(phrases.render_phrase("company_margin_below",
+                                                   value=round(cur["margin"], 1),
+                                                   target=margin_target,
+                                                   gap=round(gap, 1)))
         else:
-            lines.append(phrases.render_phrase("company_margin_below",
-                                               value=round(cur["margin"], 1),
-                                               target=margin_target,
-                                               gap=round(gap, 1)))
+            v = round(cur["margin"], 1)
+            lines.append(f"Маржа за {fmt_month_ru_genitive(current)} — {v:.1f}%.".replace(".", ","))
 
-    # 4. ДРР
+    # 4. ДРР — без выдуманных целей
     if cur.get("drr") is not None:
-        if cur["drr"] <= drr_target + 0.3:
-            lines.append(phrases.render_phrase("company_drr_ok", value=round(cur["drr"], 2), target=drr_target))
+        if drr_target is not None:
+            if cur["drr"] <= drr_target + 0.3:
+                lines.append(phrases.render_phrase("company_drr_ok", value=round(cur["drr"], 2), target=drr_target))
+            else:
+                lines.append(phrases.render_phrase("company_drr_high", value=round(cur["drr"], 2), target=drr_target))
         else:
-            lines.append(phrases.render_phrase("company_drr_high", value=round(cur["drr"], 2), target=drr_target))
+            v = round(cur["drr"], 2)
+            lines.append(f"Доля рекламных расходов за {fmt_month_ru_genitive(current)} — {v:.2f}%.".replace(".", ","))
 
     # 5. Состав задач
     if not findings:

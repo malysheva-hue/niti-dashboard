@@ -327,14 +327,26 @@ def parse_prices_xlsx():
         stock_total = None
         if s_wb is not None or s_seller is not None:
             stock_total = (s_wb or 0) + (s_seller or 0)
+        price_base = num(r[idx["Текущая цена"]]) if "Текущая цена" in idx else None
+        discount_seller = num(r[idx["Текущая скидка"]]) if "Текущая скидка" in idx else None
+        price_with_discount = num(r[idx["Цена со скидкой"]]) if "Цена со скидкой" in idx else None
+        # v1.9: «Наша цена» = базовая × (1 − скидка/100). Если xlsx даёт готовую — берём её.
+        price_after_seller = price_with_discount
+        if price_after_seller is None and price_base is not None and discount_seller is not None:
+            price_after_seller = price_base * (1 - discount_seller / 100)
         out[code] = {
-            "price": num(r[idx["Текущая цена"]]) if "Текущая цена" in idx else None,
-            "discount": num(r[idx["Текущая скидка"]]) if "Текущая скидка" in idx else None,
-            "price_with_discount": num(r[idx["Цена со скидкой"]]) if "Цена со скидкой" in idx else None,
+            # legacy keys (для совместимости с уже встроенным HTML)
+            "price": price_base,
+            "discount": discount_seller,
+            "price_with_discount": price_with_discount,
             "stock_wb": s_wb,
             "stock_seller": s_seller,
             "stock_total": stock_total,
             "turnover": num(r[idx["Оборачиваемость"]]) if "Оборачиваемость" in idx else None,
+            # v1.9 — явные «наши» поля
+            "price_seller_base": price_base,
+            "price_seller_discount": discount_seller,
+            "price_after_seller": round_n(price_after_seller, 0) if price_after_seller is not None else None,
         }
     wb.close()
     return out, src.name
@@ -798,18 +810,23 @@ DAILY_FILES_FOR_HISTORY = {
 
 
 def parse_daily_history(sku_monthly, current_month, max_sku=None):
-    """30-дневная история по 5 метрикам для всех active-SKU (orders>0 за месяц).
-    Звёзды и топ-локомотивы включаются всегда, даже если outside max_sku.
+    """30-дневная история по 5 метрикам для всех SKU из месячного среза.
+    Включаются:
+      - SKU с любыми заказами в текущем месяце ИЛИ
+      - звёзды и топ-локомотивы всегда.
+    SKU без активности и без истории просто не получат записи на выходе
+    (any_data=False внутри функции).
 
-    max_sku: если задан — отрезает по топ-N выручки (защита от раздутия data.json).
+    max_sku: если задан — отрезает по топ-N выручки.
     """
     if current_month not in sku_monthly:
         return {}
-    rows = [r for r in sku_monthly[current_month] if r.get("orders") and r["orders"] > 0]
+    # v1.9: включаем ВСЕХ из месячного среза, фильтрация по any_data произойдёт ниже
+    rows = list(sku_monthly[current_month])
     rows.sort(key=lambda r: r.get("revenue", 0) or 0, reverse=True)
     if max_sku:
         rows = rows[:max_sku]
-    target_codes = {r["code"] for r in rows}
+    target_codes = {r["code"] for r in rows if r.get("code")}
     target_codes |= STAR_CODES | LOCO_RISK_CODES
 
     series = {k: {} for k in DAILY_FILES_FOR_HISTORY}
@@ -973,6 +990,36 @@ def main():
     print("[7c] 30-дневная история для всех active SKU...")
     sku_history = parse_daily_history(sku_monthly, DEFAULT_MONTH)
     print(f"        SKU в истории: {len(sku_history)}")
+
+    # v1.9: coverage-лог по текущему месяцу
+    month_rows = sku_monthly.get(DEFAULT_MONTH, []) or []
+    total = len(month_rows)
+    with_basics = 0
+    with_7d = 0
+    with_14d = 0
+    no_history_zero_orders = 0
+    no_history_new_sku = 0
+    for r in month_rows:
+        if r.get("revenue") is not None and r.get("stock") is not None:
+            with_basics += 1
+        hist = sku_history.get(r.get("code"))
+        if hist:
+            orders_arr = [o for o in (hist.get("orders") or []) if o is not None]
+            n_days = len(orders_arr)
+            if n_days >= 7:
+                with_7d += 1
+            if n_days >= 14:
+                with_14d += 1
+        else:
+            if (r.get("orders") or 0) == 0:
+                no_history_zero_orders += 1
+            else:
+                no_history_new_sku += 1
+    def _pct(x, n): return f"{x*100/n:.0f}%" if n else "—"
+    print(f"        COVERAGE: всего {total}, с базовыми полями {with_basics} ({_pct(with_basics, total)})")
+    print(f"                  с 7д динамикой {with_7d} ({_pct(with_7d, total)})")
+    print(f"                  с 14д динамикой {with_14d} ({_pct(with_14d, total)})")
+    print(f"                  без истории: 0-заказов {no_history_zero_orders}, новые/прочие {no_history_new_sku}")
 
     print("[7d] ai_summary.json...")
     ai_summary = read_ai_summary()

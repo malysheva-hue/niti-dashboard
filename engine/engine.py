@@ -438,14 +438,14 @@ class PatternEngine:
     # 1. severity_score > 85 → попадают все (без балансировки)
     # 2. остальные balanced ≤4-5 на менеджера, общий лимит 10
     # --------------------------------------------------------
-    def prioritize(self, findings: list[Finding], total_limit: int = 10,
-                   per_manager_limit: int = 5, opportunity_reserve: int = 2) -> list[Finding]:
-        """v1.1 приоритизация:
+    def prioritize(self, findings: list[Finding], total_limit: int = 15,
+                   per_manager_limit: int = 7, opportunity_reserve: int = 3,
+                   force_star_inject: bool = True) -> list[Finding]:
+        """v1.9 приоритизация:
         1. Делим findings на risk и opportunity.
-        2. Risk сортируем по severity desc, балансируем ≤per_manager_limit на менеджера.
-        3. Резервируем opportunity_reserve слотов под opportunity (топ по severity).
-        4. Итог: до (total_limit - opp_reserved) risk-задач + до opp_reserved opportunity.
-        5. Если opportunity нет — все 10 слотов под risk.
+        2. Если force_star_inject — звёзды плана (если есть в findings) ставятся первыми.
+        3. Risk сортируем по severity desc, балансируем ≤per_manager_limit.
+        4. Резервируем opportunity_reserve слотов.
         """
         risks = sorted([f for f in findings if f.task_type == "risk"],
                        key=lambda x: -x.severity_score)
@@ -455,9 +455,20 @@ class PatternEngine:
         opp_slots = min(opportunity_reserve, len(opportunities))
         risk_limit = total_limit - opp_slots
 
+        # v1.9: звёзды плана всегда впереди (если есть в findings)
         selected_risk: list[Finding] = []
         per_mgr: dict[str, int] = {}
+        if force_star_inject:
+            star_findings = [f for f in risks if f.sku_code in ctx.STARS_CODES]
+            for f in star_findings:
+                if f in selected_risk:
+                    continue
+                selected_risk.append(f)
+                per_mgr[f.manager] = per_mgr.get(f.manager, 0) + 1
+
         for f in risks:
+            if f in selected_risk:
+                continue
             if len(selected_risk) >= risk_limit:
                 break
             cnt = per_mgr.get(f.manager, 0)
@@ -466,7 +477,6 @@ class PatternEngine:
             selected_risk.append(f)
             per_mgr[f.manager] = cnt + 1
 
-        # Если risk-задач оказалось мало (нет 8) — добавляем больше opportunity
         unused = risk_limit - len(selected_risk)
         if unused > 0 and len(opportunities) > opp_slots:
             opp_slots = min(opp_slots + unused, len(opportunities))

@@ -1,0 +1,26 @@
+id: LOCO_RISK_OOS
+description: Топ-локомотив в риске OOS (≤14 дней до нуля)
+severity_base: 60
+applies_to:
+  loco_risk_only: true
+  require_active: true
+triggers:
+  - operator: days_to_zero_with_safety
+    metric: stock
+    safety_days: 21
+diagnostics:
+  - operator: days_to_zero_with_safety
+    metric: stock
+    safety_days: 7
+    add_score: 20
+    label: critical_oos
+action_lookup:
+  default: loco.urgent_supply
+  overrides:
+    - if_stock_zero: true
+      action: loco.oos_now_panic
+    - if_diagnostics_include: [critical_oos]
+      action: loco.urgent_supply
+escalation:
+  red_threshold: 80
+  yellow_threshold: 50

@@ -1,0 +1,25 @@
+id: OOS_IMMINENT
+description: Обычный SKU — до OOS ≤7 дней при активных заказах
+severity_base: 60
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
+  exclude_stars: true
+  exclude_loco_risk: true
+  require_active: true
+triggers:
+  - operator: days_to_zero_with_safety
+    metric: stock
+    safety_days: 7
+diagnostics:
+  - operator: trend
+    metric: orders
+    window_days: 7
+    direction: up
+    min_change_pct: 20
+    add_score: 15
+    label: demand_growing
+action_lookup:
+  default: oos.normal_priority
+escalation:
+  red_threshold: 80
+  yellow_threshold: 50

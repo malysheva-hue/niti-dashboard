@@ -1,0 +1,28 @@
+id: FROZEN_CAPITAL
+description: Заморожен капитал — оборачиваемость >120 дней
+severity_base: 65
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База, Новинка, Распродажа]
+triggers:
+  - operator: threshold
+    metric: turnover
+    min: 120
+diagnostics:
+  - operator: threshold
+    metric: turnover
+    min: 180
+    add_score: 20
+    label: vyvod_zone
+  - operator: threshold
+    metric: margin
+    max: 15
+    add_score: 10
+    label: low_margin
+action_lookup:
+  default: frozen.staged_discount
+  overrides:
+    - if_diagnostics_include: [vyvod_zone]
+      action: frozen.vyvod_candidate
+escalation:
+  red_threshold: 85
+  yellow_threshold: 60

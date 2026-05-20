@@ -1,0 +1,334 @@
+"""Каталог рекомендаций (actions).
+
+Структура:
+  ACTIONS = {
+    "rule_id.diagnosis": {
+        "templates": ["вариант 1", "вариант 2"],
+        "param_calc": {param: lambda sku, finding: значение}
+    }
+  }
+
+render_action(action_key, sku, finding) — выбирает вариант, считает
+параметры из sku/finding, форматирует.
+
+Тон: конкретное действие + обоснование + альтернативы (когда есть).
+"""
+from __future__ import annotations
+
+import random
+from . import contexts as ctx
+
+
+def _safe(v, default="—"):
+    return default if v is None else v
+
+
+def _last_orders(sku, n=7):
+    h = sku.get("history", {}) or {}
+    orders = h.get("orders") or []
+    tail = [o for o in orders[-n:] if o is not None]
+    return sum(tail) / len(tail) if tail else None
+
+
+def _last_price(sku):
+    h = sku.get("history", {}) or {}
+    prices = h.get("price") or []
+    for p in reversed(prices):
+        if p is not None:
+            return p
+    return None
+
+
+def _last_spp(sku):
+    h = sku.get("history", {}) or {}
+    spp = h.get("spp") or []
+    for s in reversed(spp):
+        if s is not None:
+            return s
+    return None
+
+
+def _stock(sku):
+    return sku.get("month", {}).get("stock") if isinstance(sku.get("month"), dict) else sku.get("stock")
+
+
+def _role(sku):
+    return ctx.role_of(sku.get("group", ""))
+
+
+# ============================================================
+# СПИСОК ДЕЙСТВИЙ
+# ============================================================
+ACTIONS = {
+    # ----- ORDER_DROP -----
+    "order_drop.competitor_pressure": {
+        "templates": [
+            "Заказы просели на фоне роста цены или демпинга конкурента. Проверь топ-5 карточек по этому запросу в WB: если конкуренты ушли в −15%, протестируй цену −5% на 7 дней. Контрольный показатель — возврат к {avg_orders}/день за 5-7 дней.",
+            "Скорее всего цена выбилась из коридора рынка. Открой WB-аналитику, посмотри минимальную цену конкурентов. Если разрыв >10% — снизь нашу цену на 5-7% и держи неделю. Возврат заказов до {avg_orders}/день — критерий успеха.",
+        ],
+        "param_calc": {
+            "avg_orders": lambda sku, f: round(_last_orders(sku) or 0),
+        },
+    },
+    "order_drop.spp_recovery": {
+        "templates": [
+            "Главная причина — потеря СПП на {drop_pp} пп. Зайди в кабинет WB → СПП. Если есть доступная скидка от Wildberries — включи её до {spp_target}%. Если СПП недоступна, протестируй ручное снижение цены на {price_delta}%.",
+            "Wildberries снял часть СПП ({drop_pp} пп). В личном кабинете проверь возможность вернуть до {spp_target}%. Альтернатива — наша цена −{price_delta}% на 5 дней.",
+        ],
+        "param_calc": {
+            "drop_pp": lambda sku, f: round(f.diagnostics_details.get("spp_lost", {}).get("drop_pp", 0)),
+            "spp_target": lambda sku, f: round(f.diagnostics_details.get("spp_lost", {}).get("start", 0)),
+            "price_delta": lambda sku, f: 7,
+        },
+    },
+    "order_drop.urgent_supply": {
+        "templates": [
+            "К падению заказов добавилось приближение OOS ({days_to_oos} дней). Внеси в пятничный подсорт максимум для этого SKU. На время до прихода поставки — снизь рекламные ставки на 30%, чтобы не разогнать спрос на пустой сток.",
+            "Сток заканчивается через {days_to_oos} дней. Подсорт пятницы — обязательно. Параллельно временно отключи рекламу или урежь ставки −30% до восстановления остатка.",
+        ],
+        "param_calc": {
+            "days_to_oos": lambda sku, f: round(f.diagnostics_details.get("oos_risk", {}).get("days", 0), 1),
+        },
+    },
+
+    # ----- MARGIN_ANOMALY -----
+    "margin.below_role_lokomotiv": {
+        "templates": [
+            "Маржа Локомотива {value}% ниже коридора 22-32%. Локомотивы эластичны (−1.5), цену поднимать сразу нельзя — потеряем заказы. Сначала проверь ДРР: если выше 8%, снизь ставки на 30%, маржа подтянется на 2-3 пп.",
+            "Локомотив должен жить в марже 22-32%, у нас {value}%. Цену не трогай, эластичность −1.5 сожрёт спрос. Снижай рекламные ставки, контролируй ДРР — это даст 2-3 пп маржи.",
+        ],
+        "param_calc": {"value": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1)},
+    },
+    "margin.below_role_marginal": {
+        "templates": [
+            "Маржа Маржинального {value}% ниже целевых 30-45%. Подними цену на 5-10% и наблюдай 7 дней. Эластичность −2.0 ниже, чем у Локомотивов, потери заказов будут небольшими, маржа вернётся в коридор.",
+            "Маржинальный SKU не должен жить в марже {value}%. Тестируй +5-7% к цене, неделя на наблюдение. Если заказы просядут >15% — откатываем.",
+        ],
+        "param_calc": {"value": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1)},
+    },
+    "margin.negative_urgent": {
+        "templates": [
+            "Артикул убыточный: маржа {value}%. Каждый заказ генерирует минус. Срочно: 1) поднять цену на 12-15%, 2) если эластичность слишком высокая — выводить из ассортимента. Эскалация РОПу сегодня.",
+            "Маржа {value}% — продаём в минус. Действия: поднять цену +15% сразу или вывести из ассортимента. Дальнейшее затягивание увеличит убыток.",
+        ],
+        "param_calc": {"value": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1)},
+    },
+    "margin.below_universal": {
+        "templates": [
+            "Маржа {value}% — ниже универсального порога 20%. Проверь по чек-листу: 1) себестоимость не изменилась? 2) СПП в норме? 3) логистика 4) выкуп 5) реклама. Поднимай цену на 7-10% после диагностики.",
+            "{value}% маржи — красная линия. Пройди по списку: себестоимость, СПП, логистика, выкуп, реклама. Найди дыру, потом цена +7-10%.",
+        ],
+        "param_calc": {"value": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1)},
+    },
+
+    # ----- DRR -----
+    "drr.runaway": {
+        "templates": [
+            "ДРР {value}% — превышение в {mult}× от нормы роли «{role}» ({max}%). Срочно: 1) переведи рекламу на ручное управление, 2) снизь ставки на 40%, 3) проверь релевантность по ключам. Если за 3 дня ДРР не упадёт до {max}% — отключаем полностью.",
+            "Реклама убивает экономику: ДРР {value}% при норме {max}%. Ручной режим, ставки −40%, ревизия ключей. Дедлайн нормализации — 3 дня.",
+        ],
+        "param_calc": {
+            "value": lambda sku, f: round(sku.get("month", {}).get("drr") or 0, 1),
+            "mult": lambda sku, f: 1.5,
+            "role": lambda sku, f: _role(sku),
+            "max": lambda sku, f: ctx.ROLE_NORMS.get(_role(sku), {}).get("drr_max") or 10,
+        },
+    },
+    "drr.red_with_low_margin": {
+        "templates": [
+            "ДРР {drr}% при марже {margin}% — реклама съедает остатки маржи. Действие: ПОЛНОСТЬЮ выключи рекламу. Восстановишь после исправления цены или себестоимости.",
+            "Связка ДРР {drr}% + маржа {margin}% — рекламироваться в этом состоянии нельзя. Реклама OFF до восстановления цены.",
+        ],
+        "param_calc": {
+            "drr": lambda sku, f: round(sku.get("month", {}).get("drr") or 0, 1),
+            "margin": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1),
+        },
+    },
+    "drr.above_role_high_margin": {
+        "templates": [
+            "ДРР {value}% выше нормы роли, но маржа держится ({margin}%). Снизь ставки на 30% или переведи на ручное управление. Маржинальный запас позволяет работать аккуратно.",
+            "ДРР {value}% — выше порога, но маржа {margin}% даёт буфер. Ставки −30%, не выключаем полностью.",
+        ],
+        "param_calc": {
+            "value": lambda sku, f: round(sku.get("month", {}).get("drr") or 0, 1),
+            "margin": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1),
+        },
+    },
+
+    # ----- ЗВЁЗДЫ -----
+    "star.underperform_demand": {
+        "templates": [
+            "Звезда плана {sku} ({manager}) показывает {orders}/день — это {gap_pct}% от целевой траектории. Проверь: 1) есть ли дефицит/перебои поставки 2) позиции в выдаче за 7 дней 3) рейтинг и отзывы 4) цены 3 главных конкурентов. На основе диагностики — точечное действие. НЕ режь цену сразу.",
+            "{sku} — звезда, должна показывать {target_orders}/день, по факту {orders}. Не торопись с ценой. Сначала ищем причину: сток, позиции, рейтинг, конкуренты. Только потом — реклама/цена.",
+        ],
+        "param_calc": {
+            "sku": lambda sku, f: sku.get("code"),
+            "manager": lambda sku, f: sku.get("manager", "—"),
+            "orders": lambda sku, f: round(_last_orders(sku) or 0),
+            "target_orders": lambda sku, f: round((_last_orders(sku) or 0) * 1.4) or 10,
+            "gap_pct": lambda sku, f: -30,
+        },
+    },
+    "star.maintain_growth": {
+        "templates": [
+            "{sku} ({manager}) — звезда растёт по плану. Удерживай: реклама в текущем бюджете, цена без изменений. Следим, чтобы сток покрывал ускорение.",
+            "Звезда {sku} держит траекторию. Главное — не сломать. Сток мониторим ежедневно, бюджет рекламы — без правок.",
+        ],
+        "param_calc": {
+            "sku": lambda sku, f: sku.get("code"),
+            "manager": lambda sku, f: sku.get("manager", "—"),
+        },
+    },
+
+    # ----- ТОП-ЛОКОМОТИВ -----
+    "loco.urgent_supply": {
+        "templates": [
+            "Локомотив {sku} ({manager}): {days} дней до OOS при скорости {velocity}/день. Подсорт Королёв→ВБ в пятницу (lead 3 дня). Если поставка не успевает — снизь рекламу −50% до прихода стока, чтобы не разогреть спрос на пустоту.",
+            "{sku} — топ-локомотив, до нуля {days} дней. В пятничный подсорт — приоритет. До прихода стока — режем рекламу вдвое.",
+        ],
+        "param_calc": {
+            "sku": lambda sku, f: sku.get("code"),
+            "manager": lambda sku, f: sku.get("manager", "—"),
+            "days": lambda sku, f: round(f.diagnostics_details.get("oos", {}).get("days", 0), 1),
+            "velocity": lambda sku, f: round(f.diagnostics_details.get("oos", {}).get("velocity", 0), 1),
+        },
+    },
+    "loco.oos_now_panic": {
+        "templates": [
+            "Локомотив {sku} в OOS прямо сейчас. 1) Экстренная поставка вне расписания если есть возможность 2) Реклама — полностью off 3) Уведоми менеджера ({manager}) о потере позиций.",
+            "{sku} — топ, сток ноль. Экстренная отправка → отключение рекламы → менеджер ({manager}) в курсе.",
+        ],
+        "param_calc": {
+            "sku": lambda sku, f: sku.get("code"),
+            "manager": lambda sku, f: sku.get("manager", "—"),
+        },
+    },
+
+    # ----- РОСТ -----
+    "growth.activate_paid": {
+        "templates": [
+            "{sku} ({manager}) растёт без рекламы. Маржа {margin}% — есть запас. Действие: запусти ручную ставку с бюджетом 200₽/день на 5 дней. Точка роста ×3 при минимальном риске.",
+            "Органический рост у {sku} — пора подключать платный трафик. Ручные ставки, 200₽/день, неделя теста. Маржа {margin}% страхует.",
+        ],
+        "param_calc": {
+            "sku": lambda sku, f: sku.get("code"),
+            "manager": lambda sku, f: sku.get("manager", "—"),
+            "margin": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1),
+        },
+    },
+    "growth.scale_up": {
+        "templates": [
+            "{sku}: маржа {margin}%, ДРР всего {drr}% — реклама недогружена. Усиль ставки на 30%, бюджет +50%. Тест 7 дней, контроль через прибыль/день.",
+            "У {sku} ({manager}) запас по марже и низкий ДРР {drr}%. Усиливаем рекламу: +30% к ставкам, +50% к дневному бюджету.",
+        ],
+        "param_calc": {
+            "sku": lambda sku, f: sku.get("code"),
+            "manager": lambda sku, f: sku.get("manager", "—"),
+            "margin": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1),
+            "drr": lambda sku, f: round(sku.get("month", {}).get("drr") or 0, 2),
+        },
+    },
+
+    # ----- ЗАМОРОЗКА -----
+    "frozen.staged_discount": {
+        "templates": [
+            "Оборачиваемость {days} дней, заморозка {frozen} ₽. Запусти акцию ступенчато: −10% сразу, через 7 дней ещё −10% если не разгонится. Резкое снижение >20% за раз бьёт по карантину WB.",
+            "{days} дней оборота — нужна разгрузка. Шаг 1: −10% на неделю. Шаг 2 (если не разогналось): ещё −10%. Не больше чем по 10% за раз — карантин WB.",
+        ],
+        "param_calc": {
+            "days": lambda sku, f: round(sku.get("month", {}).get("turnover") or 0),
+            "frozen": lambda sku, f: round(sku.get("month", {}).get("frozen") or 0),
+        },
+    },
+    "frozen.vyvod_candidate": {
+        "templates": [
+            "Кандидат на вывод: выручка низкая, маржа {margin}%, оборот {days} дней. Рассмотри: 1) последняя распродажа −30% за 7 дней 2) вывод из ассортимента после распродажи.",
+            "{sku}: оборот {days} дней, маржа {margin}% — характеристики неликвида. Финальная распродажа −30% или вывод.",
+        ],
+        "param_calc": {
+            "sku": lambda sku, f: sku.get("code"),
+            "days": lambda sku, f: round(sku.get("month", {}).get("turnover") or 0),
+            "margin": lambda sku, f: round(sku.get("month", {}).get("margin") or 0, 1),
+        },
+    },
+
+    # ----- OOS_IMMINENT (обычный SKU) -----
+    "oos.normal_priority": {
+        "templates": [
+            "До OOS {days} дней. В пятничный подсорт — включи. Объём поставки: 30 дней × {velocity}/день = {qty} шт минимум.",
+            "{days} дней до нуля. Подсорт пятницы. Минимум на месяц: ≈{qty} шт.",
+        ],
+        "param_calc": {
+            "days": lambda sku, f: round(f.diagnostics_details.get("oos", {}).get("days", 0), 1),
+            "velocity": lambda sku, f: round(f.diagnostics_details.get("oos", {}).get("velocity", 0), 1),
+            "qty": lambda sku, f: round((f.diagnostics_details.get("oos", {}).get("velocity", 0)) * 30),
+        },
+    },
+
+    # ----- PRICE_COMPETITOR -----
+    "price.investigate_competitor": {
+        "templates": [
+            "Цена выросла на {pct}%, заказы просели. Проверь топ-5 карточек по запросу: где конкуренты? Если они на 10-15% ниже — откати нашу цену к прежнему уровню или дай скидку через WB. Срок наблюдения после правки — 5 дней.",
+            "После скачка цены {pct}% заказы пошли вниз. Сначала разведка конкурентов через WB-поиск, потом — корректировка. Контрольный период 5 дней.",
+        ],
+        "param_calc": {
+            "pct": lambda sku, f: round(f.diagnostics_details.get("price_grew", {}).get("jump_pct", 0)),
+        },
+    },
+
+    # ----- SEASONAL -----
+    "seasonal.boost_peak": {
+        "templates": [
+            "Категория «{category}» вошла в сезонный пик. Усиль рекламу +50% к бюджету, проверь что сток покрывает 30 дней пиковых продаж.",
+            "Сезон {category} начался. Увеличь бюджет рекламы в полтора раза, контролируй сток на покрытие 30 дней.",
+        ],
+        "param_calc": {
+            "category": lambda sku, f: sku.get("category", "—"),
+        },
+    },
+    "seasonal.miss_peak": {
+        "templates": [
+            "По календарю — пик сезона «{category}», но рост слабый. Запусти рекламную кампанию на 14 дней, ставки +20%, проверь карточку (фото, заголовок, ключи).",
+            "{category} должен быть в пике. Нужно расшевелить: реклама на 2 недели, ставки +20%, ревизия карточки.",
+        ],
+        "param_calc": {
+            "category": lambda sku, f: sku.get("category", "—"),
+        },
+    },
+
+    # ----- multiple / fallback -----
+    "multiple_issues": {
+        "templates": [
+            "Сошлось несколько проблем сразу. Это уже не точечная история — эскалируй РОПу, нужно ручное решение.",
+            "Несколько симптомов одновременно. Шаг за шагом не сработает — нужна сборка с РОПом.",
+        ],
+        "param_calc": {},
+    },
+    "excellent": {
+        "templates": [
+            "Всё в коридоре роли. Удерживаем текущие настройки.",
+            "Показатели в норме — ничего не меняем, наблюдаем.",
+        ],
+        "param_calc": {},
+    },
+}
+
+
+def render_action(action_key: str, sku: dict, finding) -> str:
+    """Рендерит действие по ключу с подстановкой параметров."""
+    spec = ACTIONS.get(action_key)
+    if not spec:
+        return f"[action missing: {action_key}]"
+    templates = spec["templates"]
+    idx = random.randrange(len(templates))
+    template = templates[idx]
+    params = {}
+    for name, fn in spec.get("param_calc", {}).items():
+        try:
+            params[name] = fn(sku, finding)
+        except Exception:
+            params[name] = "—"
+    try:
+        return template.format(**params)
+    except (KeyError, IndexError) as e:
+        return f"[action error: {action_key}: {e}]"

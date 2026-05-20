@@ -76,6 +76,21 @@ def round_n(v, ndigits=2):
     return round(v, ndigits)
 
 
+def _date_key(s):
+    """Ключ для корректной сортировки строк формата dd.mm.yyyy.
+    Возвращает (yyyy, mm, dd). Битые/пустые строки → (0,0,0)."""
+    if not s:
+        return (0, 0, 0)
+    parts = str(s).split(".")
+    if len(parts) != 3:
+        return (0, 0, 0)
+    try:
+        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        return (y, m, d)
+    except (TypeError, ValueError):
+        return (0, 0, 0)
+
+
 def parse_summary_csv():
     out = []
     with open(CSV_DIR / "00_Сводка_по_месяцам.csv", encoding="utf-8") as f:
@@ -472,8 +487,8 @@ def parse_daily_yesterday(sku_monthly):
     if not rev_by_date:
         return None
 
-    # последняя и предпоследняя даты
-    dates = sorted(rev_by_date.keys())
+    # последняя и предпоследняя даты (сортировка по (yyyy,mm,dd), не лексикографически)
+    dates = sorted(rev_by_date.keys(), key=_date_key)
     last = dates[-1]
     prev = dates[-2] if len(dates) >= 2 else None
 
@@ -557,8 +572,8 @@ def parse_daily_history(sku_monthly, current_month, top_n=100):
                 series[metric].setdefault(code, {})[date] = v
                 all_dates.add(date)
 
-    # последние 30 дат
-    dates_30 = sorted(all_dates)[-30:]
+    # последние 30 дат (по календарному порядку, не лексикографическому)
+    dates_30 = sorted(all_dates, key=_date_key)[-30:]
     out = {}
     for code in top_codes:
         per = {"dates": dates_30}

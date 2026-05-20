@@ -1,6 +1,6 @@
 id: OOS_IMMINENT
 description: Обычный SKU — до OOS ≤7 дней при активных заказах
-severity_base: 60
+severity_base: 50
 applies_to:
   roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
   exclude_stars: true
@@ -16,7 +16,7 @@ diagnostics:
     window_days: 7
     direction: up
     min_change_pct: 20
-    add_score: 15
+    add_score: 20
     label: demand_growing
 action_lookup:
   default: oos.normal_priority

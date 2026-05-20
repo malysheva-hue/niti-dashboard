@@ -1,6 +1,6 @@
 id: GROWTH_OPPORTUNITY
 description: Точка роста — заказы растут на фоне низкой нагрузки рекламы
-severity_base: 50
+severity_base: 40
 task_type: opportunity
 applies_to:
   roles: [Локомотив, Маржинальный, Новинка, База]

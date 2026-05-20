@@ -172,11 +172,14 @@ def role_of(group: str) -> str:
 
 
 def boost_for_sku(code: str) -> int:
-    """Приоритетный буст для звёзд (+30) и локо-риска (+25). Иначе 0."""
+    """Приоритетный буст для звёзд (+20) и локо-риска (+15). Иначе 0.
+
+    v1.1: понижены с +30 / +25, чтобы давать разнообразие severity.
+    """
     if code in STARS_CODES:
-        return 30
+        return 20
     if code in LOCO_RISK_CODES:
-        return 25
+        return 15
     return 0
 
 

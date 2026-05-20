@@ -385,16 +385,19 @@ class PatternEngine:
                     continue
 
                 bonus, diag_labels, diag_details = self._evaluate_diagnostics(rule, sku)
-                severity = min(100, rule.severity_base + bonus + ctx.boost_for_sku(sku["code"]))
+                # v1.1: убран clamp, шкала растянута до 30..180
+                severity = rule.severity_base + bonus + ctx.boost_for_sku(sku["code"])
 
-                priority = "yellow"
-                if severity >= rule.escalation.get("red_threshold", 85):
-                    priority = "red"
-
+                # v1.1: priority пороги — red >=120, yellow >=70, иначе отсев
                 task_type = "opportunity" if rule.raw.get("task_type") == "opportunity" else "risk"
-                # opportunity не бывает red
                 if task_type == "opportunity":
                     priority = "yellow"
+                elif severity >= 120:
+                    priority = "red"
+                elif severity >= 70:
+                    priority = "yellow"
+                else:
+                    continue  # отсев — слишком слабый сигнал
 
                 action_key = self._lookup_action(rule, sku, diag_labels, diag_details)
 
@@ -436,39 +439,38 @@ class PatternEngine:
     # 2. остальные balanced ≤4-5 на менеджера, общий лимит 10
     # --------------------------------------------------------
     def prioritize(self, findings: list[Finding], total_limit: int = 10,
-                   per_manager_limit: int = 5, critical_threshold: int = 90) -> list[Finding]:
-        """Приоритизация по правилам Антона:
-        1. Сначала critical (severity > 90), КАЖДЫЙ менеджер получает свой топ-N.
-        2. Потом yellow добиваем до total_limit с балансировкой ≤ per_manager_limit.
-        3. Hard cap = total_limit + 3 (мягкое нарушение лимита для критики).
+                   per_manager_limit: int = 5, opportunity_reserve: int = 2) -> list[Finding]:
+        """v1.1 приоритизация:
+        1. Делим findings на risk и opportunity.
+        2. Risk сортируем по severity desc, балансируем ≤per_manager_limit на менеджера.
+        3. Резервируем opportunity_reserve слотов под opportunity (топ по severity).
+        4. Итог: до (total_limit - opp_reserved) risk-задач + до opp_reserved opportunity.
+        5. Если opportunity нет — все 10 слотов под risk.
         """
-        hard_cap = total_limit + 3
-        sorted_f = sorted(findings, key=lambda x: -x.severity_score)
+        risks = sorted([f for f in findings if f.task_type == "risk"],
+                       key=lambda x: -x.severity_score)
+        opportunities = sorted([f for f in findings if f.task_type == "opportunity"],
+                               key=lambda x: -x.severity_score)
 
-        critical = [f for f in sorted_f if f.severity_score > critical_threshold]
-        rest = [f for f in sorted_f if f.severity_score <= critical_threshold]
+        opp_slots = min(opportunity_reserve, len(opportunities))
+        risk_limit = total_limit - opp_slots
 
-        selected = []
+        selected_risk: list[Finding] = []
         per_mgr: dict[str, int] = {}
-
-        # 1. Критика — даём каждому менеджеру до per_manager_limit, общий cap hard_cap
-        for f in critical:
-            if len(selected) >= hard_cap:
+        for f in risks:
+            if len(selected_risk) >= risk_limit:
                 break
             cnt = per_mgr.get(f.manager, 0)
             if cnt >= per_manager_limit:
                 continue
-            selected.append(f)
+            selected_risk.append(f)
             per_mgr[f.manager] = cnt + 1
 
-        # 2. Yellow до total_limit с балансировкой
-        for f in rest:
-            if len(selected) >= total_limit:
-                break
-            cnt = per_mgr.get(f.manager, 0)
-            if cnt >= per_manager_limit:
-                continue
-            selected.append(f)
-            per_mgr[f.manager] = cnt + 1
+        # Если risk-задач оказалось мало (нет 8) — добавляем больше opportunity
+        unused = risk_limit - len(selected_risk)
+        if unused > 0 and len(opportunities) > opp_slots:
+            opp_slots = min(opp_slots + unused, len(opportunities))
 
-        return selected
+        selected_opp = opportunities[:opp_slots]
+
+        return selected_risk + selected_opp

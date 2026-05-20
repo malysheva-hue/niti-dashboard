@@ -1,6 +1,6 @@
 id: STAR_UNDERPERFORM
 description: Звезда плана отстаёт от целевой траектории
-severity_base: 55
+severity_base: 40
 applies_to:
   stars_only: true
 triggers:
@@ -13,13 +13,13 @@ diagnostics:
   - operator: days_to_zero_with_safety
     metric: stock
     safety_days: 21
-    add_score: 15
+    add_score: 20
     label: stock_thin
   - operator: spp_drop_detected
     metric: spp
     window_days: 7
     threshold_pp: 3
-    add_score: 10
+    add_score: 15
     label: spp_lost
 action_lookup:
   default: star.underperform_demand

@@ -1,6 +1,6 @@
 id: ORDER_DROP_DETAILED
 description: Падение заказов >30% за 7 дней с диагностикой причин (цена, СПП, OOS)
-severity_base: 70
+severity_base: 55
 applies_to:
   roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
   require_active: true
@@ -15,18 +15,18 @@ diagnostics:
     metric: price
     window_days: 7
     jump_pct: 5
-    add_score: 20
+    add_score: 15
     label: price_grew
   - operator: spp_drop_detected
     metric: spp
     window_days: 7
     threshold_pp: 5
-    add_score: 15
+    add_score: 12
     label: spp_lost
   - operator: days_to_zero_with_safety
     metric: stock
     safety_days: 14
-    add_score: 10
+    add_score: 20
     label: oos_risk
 action_lookup:
   default: order_drop.competitor_pressure

@@ -115,7 +115,7 @@ def main():
     print(f"  after dedup: {len(deduped)}")
 
     final = engine_obj.prioritize(deduped, total_limit=10,
-                                  per_manager_limit=5, critical_threshold=85)
+                                  per_manager_limit=5, opportunity_reserve=2)
     print(f"  final (top-10): {len(final)}")
 
     # ---- диагностика правил с 0 findings ----

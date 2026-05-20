@@ -536,25 +536,29 @@ def parse_daily_yesterday(sku_monthly):
 
 DAILY_FILES_FOR_HISTORY = {
     "orders": "Дневная_Факт_заказов.csv",
-    "revenue": "Дневная_Сумма_заказов.csv",
-    "stock": "Дневная_Остаток.csv",
-    "spp": "Дневная_СПП.csv",
     "price": "Дневная_Цена_после_СПП.csv",
+    "spp": "Дневная_СПП.csv",
+    "stock": "Дневная_Остаток.csv",
+    "profit": "Дневная_Прибыль.csv",
 }
 
 
-def parse_daily_history(sku_monthly, current_month, top_n=100):
-    """Для топ-N SKU выбранного месяца — 30-дневная история по 5 метрикам.
-    Возвращает {code: {dates, orders, revenue, stock, spp, price}}."""
+def parse_daily_history(sku_monthly, current_month, max_sku=None):
+    """30-дневная история по 5 метрикам для всех active-SKU (orders>0 за месяц).
+    Звёзды и топ-локомотивы включаются всегда, даже если outside max_sku.
+
+    max_sku: если задан — отрезает по топ-N выручки (защита от раздутия data.json).
+    """
     if current_month not in sku_monthly:
         return {}
-    rows = [r for r in sku_monthly[current_month] if r.get("revenue") and r["revenue"] > 0]
-    rows.sort(key=lambda r: r.get("revenue", 0), reverse=True)
-    top_codes = {r["code"] for r in rows[:top_n]}
-    # звёзды и локомотивы — всегда включаем
-    top_codes |= STAR_CODES | LOCO_RISK_CODES
+    rows = [r for r in sku_monthly[current_month] if r.get("orders") and r["orders"] > 0]
+    rows.sort(key=lambda r: r.get("revenue", 0) or 0, reverse=True)
+    if max_sku:
+        rows = rows[:max_sku]
+    target_codes = {r["code"] for r in rows}
+    target_codes |= STAR_CODES | LOCO_RISK_CODES
 
-    series = {k: {} for k in DAILY_FILES_FOR_HISTORY}  # {metric: {code: {date: v}}}
+    series = {k: {} for k in DAILY_FILES_FOR_HISTORY}
     all_dates = set()
     for metric, fname in DAILY_FILES_FOR_HISTORY.items():
         path = CSV_DIR / fname
@@ -563,7 +567,7 @@ def parse_daily_history(sku_monthly, current_month, top_n=100):
         with open(path, encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 code = row.get("Артикул поставщика")
-                if not code or code not in top_codes:
+                if not code or code not in target_codes:
                     continue
                 date = row.get("Дата")
                 v = num(row.get("Значение"))
@@ -572,10 +576,9 @@ def parse_daily_history(sku_monthly, current_month, top_n=100):
                 series[metric].setdefault(code, {})[date] = v
                 all_dates.add(date)
 
-    # последние 30 дат (по календарному порядку, не лексикографическому)
     dates_30 = sorted(all_dates, key=_date_key)[-30:]
     out = {}
-    for code in top_codes:
+    for code in target_codes:
         per = {"dates": dates_30}
         any_data = False
         for metric in DAILY_FILES_FOR_HISTORY:
@@ -713,8 +716,8 @@ def main():
     if yesterday and yesterday.get("last"):
         print(f"        последний день в данных: {yesterday['last']['date']}")
 
-    print("[7c] 30-дневная история топ-100 SKU для модалок...")
-    sku_history = parse_daily_history(sku_monthly, DEFAULT_MONTH, top_n=100)
+    print("[7c] 30-дневная история для всех active SKU...")
+    sku_history = parse_daily_history(sku_monthly, DEFAULT_MONTH)
     print(f"        SKU в истории: {len(sku_history)}")
 
     print("[7d] ai_summary.json...")

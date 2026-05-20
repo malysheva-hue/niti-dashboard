@@ -1,6 +1,6 @@
 id: MARGIN_ANOMALY
 description: Маржа ниже нормы роли или универсального порога 20%
-severity_base: 65
+severity_base: 45
 applies_to:
   roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
   require_active: true
@@ -11,12 +11,12 @@ diagnostics:
   - operator: threshold
     metric: margin
     max: 0
-    add_score: 30
+    add_score: 60
     label: negative_margin
   - operator: threshold
     metric: margin
     max: 20
-    add_score: 15
+    add_score: 20
     label: below_universal
 action_lookup:
   default: margin.below_universal

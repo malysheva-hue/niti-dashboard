@@ -1,6 +1,6 @@
 id: SEASONAL_SIGNAL
 description: Сезонная категория показывает аномалию относительно ожидаемой фазы
-severity_base: 50
+severity_base: 35
 applies_to:
   seasonal_only: true
   require_active: true
@@ -16,14 +16,14 @@ diagnostics:
     window_days: 14
     direction: up
     min_change_pct: 30
-    add_score: 10
+    add_score: 15
     label: peak_strong
   - operator: trend
     metric: orders
     window_days: 14
     direction: down
     min_change_pct: -30
-    add_score: 15
+    add_score: 25
     label: peak_weak
 action_lookup:
   default: seasonal.boost_peak

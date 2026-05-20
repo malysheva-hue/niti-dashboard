@@ -1,6 +1,6 @@
 id: DRR_RUNAWAY
 description: ДРР превышает норму роли более чем в 1.5×
-severity_base: 75
+severity_base: 55
 applies_to:
   roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
   require_active: true
@@ -12,7 +12,7 @@ diagnostics:
   - operator: threshold
     metric: margin
     max: 25
-    add_score: 20
+    add_score: 45
     label: low_margin_too
 action_lookup:
   default: drr.runaway

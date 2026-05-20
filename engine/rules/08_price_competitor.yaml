@@ -1,6 +1,6 @@
 id: PRICE_COMPETITOR
 description: Скачок цены вверх или потеря СПП на фоне падения заказов
-severity_base: 70
+severity_base: 55
 applies_to:
   roles: [Локомотив, Маржинальный, Допродажный, База]
   require_active: true
@@ -20,7 +20,7 @@ diagnostics:
     window_days: 7
     direction: down
     min_change_pct: -15
-    add_score: 20
+    add_score: 25
     label: orders_dropping
 action_lookup:
   default: price.investigate_competitor

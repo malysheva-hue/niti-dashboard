@@ -71,6 +71,12 @@ def _problem_text(finding: Finding) -> str:
                                      window=7,
                                      min=td.get("min", "—"),
                                      max=td.get("max", "—"))
+    if rid == "HIGH_TURNOVER_LOW_PRICE":
+        turn = round(m.get("turnover") or 0)
+        return f"Товар уходит за {turn} дней при сниженной за 7 дней цене — спрос держит, можно вернуть цену."
+    if rid == "STAGNATION":
+        turn = round(m.get("turnover") or 0)
+        return f"Оборачиваемость {turn} дней — товар стоит, замораживает капитал."
     if rid == "SEASONAL_SIGNAL":
         return phrases.render_phrase("seasonal_peak_strong" if "peak_strong" in finding.diagnostics else "seasonal_peak_weak",
                                      category=sku.get("category", "—"),
@@ -161,34 +167,74 @@ def _build_changes(sku: dict) -> list[dict]:
                 "unit": "₽",
             })
 
+    # v2.1: ДРР day-7 → day-1
+    drr = h.get("drr") or []
+    if len(drr) >= 14:
+        prev7 = mean_window(drr, len(drr) - 7, 7)
+        last7 = mean_last(drr, 7)
+        if prev7 is not None and last7 is not None:
+            dp = last7 - prev7  # пп
+            # норма роли
+            role = ctx.role_of(sku.get("group", "") or "")
+            norm_drr = (ctx.ROLE_NORMS.get(role) or {}).get("drr_max")
+            is_bad = (norm_drr is not None and last7 > norm_drr) or (dp > 2)
+            changes.append({
+                "label": "ДРР",
+                "from": round(prev7, 1),
+                "to": round(last7, 1),
+                "delta_pp": round(dp, 1),
+                "delta_dir": "up" if dp > 0 else "down" if dp < 0 else "flat",
+                "is_bad": is_bad,
+                "unit": "%",
+            })
+
+    # v2.1: Конверсия в заказ day-7 → day-1
+    conv = h.get("conv") or []
+    if len(conv) >= 14:
+        prev7 = mean_window(conv, len(conv) - 7, 7)
+        last7 = mean_last(conv, 7)
+        if prev7 is not None and last7 is not None:
+            dp = last7 - prev7  # пп
+            is_bad = last7 < 3 or dp < -0.5
+            changes.append({
+                "label": "Конверсия в заказ",
+                "from": round(prev7, 1),
+                "to": round(last7, 1),
+                "delta_pp": round(dp, 1),
+                "delta_dir": "up" if dp > 0 else "down" if dp < 0 else "flat",
+                "is_bad": is_bad,
+                "unit": "%",
+            })
+
     stock = h.get("stock") or []
     if len(stock) >= 14:
         prev_val = stock[-8] if len(stock) >= 8 and stock[-8] is not None else None
         last_val = stock[-1] if stock and stock[-1] is not None else None
         if prev_val is not None and last_val is not None:
-            dp = _delta_pct(prev_val, last_val)
-            # v1.9: цвет остатка — НЕ по знаку, а по дням до нуля на складе.
-            # Velocity берём из последних 7 дней заказов.
             last7_orders = [o for o in (orders[-7:] if orders else []) if o is not None]
+            sold_7 = int(round(sum(last7_orders))) if last7_orders else None
             velocity = sum(last7_orders) / len(last7_orders) if last7_orders else None
             days_to_zero = (last_val / velocity) if (velocity and velocity > 0) else None
-            # bad/good
+            # v2.1 — цвет по дням до нуля на складе, тон/знак не имеет
+            # значения для семантики «продаётся ли товар нормально».
+            stock_growing = (last_val - prev_val) > 0
+            orders_dropped_30 = (sold_7 or 0) < (sum([o for o in (orders[-14:-7] if len(orders) >= 14 else []) if o is not None]) * 0.7)
             if days_to_zero is not None and days_to_zero < 7:
-                is_bad = True
-            elif days_to_zero is not None and days_to_zero > 14 and (dp or 0) < 0:
-                is_bad = False   # падает — но запас на 14+ дней есть
-            elif (dp or 0) > 0 and last7_orders and velocity is not None and velocity < 1:
-                is_bad = True    # растёт остаток, заказы стоят → залёг
+                stock_status = "red"
+            elif days_to_zero is not None and days_to_zero <= 14:
+                stock_status = "yellow"
+            elif stock_growing and orders_dropped_30:
+                stock_status = "yellow"  # залежался
             else:
-                is_bad = False
+                stock_status = "flat"   # норма
             changes.append({
                 "label": "Остаток",
-                "from": int(prev_val),
-                "to": int(last_val),
-                "delta_pct": round(dp, 1) if dp is not None else None,
-                "delta_dir": "up" if (dp or 0) > 0 else "down" if (dp or 0) < 0 else "flat",
-                "is_bad": is_bad,
+                "kind": "stock",
+                "sold_7d": sold_7,
+                "stock_now": int(last_val),
                 "days_to_zero": round(days_to_zero, 1) if days_to_zero is not None else None,
+                "status": stock_status,
+                "is_bad": stock_status == "red",
                 "unit": "шт",
             })
 
@@ -555,7 +601,7 @@ def _classify_star(cur_month: dict, tempo: float | None, role: str):
 
     # red checks
     if stock == 0 and orders > 0:
-        return "red", "OOS при активных заказах"
+        return "red", "товара нет на складе при активных заказах"
     if margin is not None and margin < 0:
         return "red", f"маржа {margin:.1f}% — убыточный"
     if tempo is not None and tempo < 70:
@@ -655,14 +701,14 @@ def render_stars_status(data: dict) -> list[dict]:
 # ============================================================
 def _classify_loco(days_to_oos, stock):
     if stock == 0:
-        return "red", "OOS — продаём с прерываниями"
+        return "red", "товара нет на складе — продаём с прерываниями"
     if days_to_oos is None:
         return "yellow", "нет данных по скорости продаж"
     if days_to_oos < 7:
-        return "red", f"OOS через {days_to_oos:.1f} дн — критично"
+        return "red", f"хватит на {days_to_oos:.1f} дн — критично"
     if days_to_oos <= 14:
-        return "yellow", f"OOS через {days_to_oos:.1f} дн — следить"
-    return "green", f"OOS через {days_to_oos:.1f} дн — норма"
+        return "yellow", f"хватит на {days_to_oos:.1f} дн — следить"
+    return "green", f"хватит на {days_to_oos:.1f} дн — норма"
 
 
 def render_loco_risk_status(data: dict) -> list[dict]:

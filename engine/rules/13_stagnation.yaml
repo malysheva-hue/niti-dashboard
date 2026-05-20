@@ -1,0 +1,20 @@
+id: STAGNATION
+description: Залёг — 0 заказов 7+ дней при остатке >50 шт
+severity_base: 50
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
+triggers:
+  - operator: threshold
+    metric: turnover
+    max: 90      # matched когда turnover>90 (медленный)
+diagnostics:
+  - operator: threshold
+    metric: turnover
+    max: 120
+    add_score: 15
+    label: very_slow
+action_lookup:
+  default: stagnation.boost
+escalation:
+  red_threshold: 80
+  yellow_threshold: 55

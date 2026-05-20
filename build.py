@@ -814,9 +814,15 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             } for m, v in by_mgr.items()},
         }
 
+    # v2.1: навигатор последних 7 дней
+    last7 = dates[-7:]
+    days = [snapshot(d) for d in last7]
+    days = [d for d in days if d is not None]
+
     return {
         "last": snapshot(last_d),
         "prev": snapshot(prev_d),
+        "days": days,
         "mpstats_meta": {
             "last_known_date": mpstats_last_date,
             "today": today_str,
@@ -832,10 +838,14 @@ METRIC_TO_INDICATOR = {
     "spp":     "СПП",
     "stock":   "Остаток",
     "profit":  "Прибыль, руб",
+    # v2.1: ДРР и Конверсия для строк changes в карточках
+    "drr":     "ДРР от рекламных продаж",
+    "conv":    "Конверсия в заказ",
 }
 
 
 _INT_METRICS = {"orders", "stock"}
+_PRECISE_METRICS = {"drr", "conv", "spp"}  # 2 знака
 
 
 def _compact_value(metric, v):
@@ -843,6 +853,8 @@ def _compact_value(metric, v):
         return None
     if metric in _INT_METRICS:
         return int(round(v))
+    if metric in _PRECISE_METRICS:
+        return round(v, 2)
     return round(v, 1)
 
 

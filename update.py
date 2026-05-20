@@ -114,10 +114,17 @@ def main():
     deduped = engine_obj.dedupe(raw_findings)
     print(f"  after dedup: {len(deduped)}")
 
-    final = engine_obj.prioritize(deduped, total_limit=15,
-                                  per_manager_limit=7, opportunity_reserve=3,
+    # v2.3 БЛОК 1: классификация хорошо/плохо ДО приоритизации, чтобы limit считался корректно
+    from engine.assembler import filter_findings_classification
+    deduped = filter_findings_classification(deduped)
+    reclassified = sum(1 for f in deduped if any("reclassified" in str(d) for d in (f.diagnostics or [])))
+    print(f"  reclassified opp→risk: {reclassified}")
+
+    # v2.3 БЛОК 6: 10-15 задач на менеджера, общий лимит 45 (3 менеджера × 15)
+    final = engine_obj.prioritize(deduped, total_limit=45,
+                                  per_manager_limit=15, opportunity_reserve=5,
                                   force_star_inject=True)
-    print(f"  final (top-10): {len(final)}")
+    print(f"  final: {len(final)}")
 
     # ---- диагностика правил с 0 findings ----
     print()

@@ -209,6 +209,40 @@ def trend(series, window_days: int = 7, direction: str = "down", min_change_pct:
                                                      "window": window_days})
 
 
+def single_day_change(series, metric: str = "pct", direction: str = "down", threshold: float = 50):
+    """v2.3: сравнивает последние 2 значения в серии.
+
+    metric: 'pct' (процентное изменение) или 'pp' (разница в процентных пунктах).
+    matched=True если изменение прошло порог в указанном направлении.
+
+    Пример: single_day_change([10,15,12,11,5], 'pct', 'down', 50) →
+            matched=True (5 vs 11, −54%).
+    """
+    clean = _clean(series)
+    if len(clean) < 2:
+        return EMPTY
+    last_v = clean[-1]
+    prev_v = clean[-2]
+    if metric == "pp":
+        delta = last_v - prev_v
+    else:
+        if prev_v == 0:
+            return EMPTY
+        delta = (last_v - prev_v) / abs(prev_v) * 100
+    matched = False
+    if direction == "down" and delta <= -abs(threshold):
+        matched = True
+    elif direction == "up" and delta >= abs(threshold):
+        matched = True
+    elif direction == "any" and abs(delta) >= abs(threshold):
+        matched = True
+    if not matched:
+        return EMPTY
+    return OpResult(True, min(100, int(abs(delta))),
+                    {"last": round(last_v, 2), "prev": round(prev_v, 2),
+                     "delta": round(delta, 2), "metric": metric})
+
+
 def moving_average(series, window: int = 7):
     """Скользящее среднее. Возвращает список значений MA."""
     clean = _clean(series)
@@ -625,6 +659,7 @@ OPERATORS = {
     "relative_gap": relative_gap,
     # trend
     "trend": trend,
+    "single_day_change": single_day_change,
     "moving_average": moving_average,
     "acceleration": acceleration,
     "volatility": volatility,

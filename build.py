@@ -387,6 +387,42 @@ def parse_prices_xlsx():
     return out, src.name
 
 
+def compute_sku_plans(plan_fact):
+    """v2.3 БЛОК 5: достаём планы по SKU из План-Факта.
+
+    Возвращает {code: {plan_revenue, plan_orders, plan_profit, fact_revenue, fact_orders, fact_profit}}.
+    Только SKU с реальными планами.
+    """
+    PLAN_MAP = {
+        "Плановая сумма заказов, руб": "plan_revenue",
+        "План заказов, шт": "plan_orders",
+        "Прогноз прибыли, руб": "plan_profit",   # ближайший прокси
+    }
+    FACT_MAP = {
+        "Сумма заказов, руб": "fact_revenue",
+        "Факт заказов, шт": "fact_orders",
+        "Прибыль, руб": "fact_profit",
+    }
+    out = {}
+    for code, indicators in (plan_fact or {}).items():
+        row = {}
+        for ind_name, vals in (indicators or {}).items():
+            if not ind_name or not isinstance(vals, dict):
+                continue
+            totals = vals.get("totals")
+            n = num(totals)
+            if n is None:
+                continue
+            if ind_name in PLAN_MAP:
+                row[PLAN_MAP[ind_name]] = n
+            elif ind_name in FACT_MAP:
+                row[FACT_MAP[ind_name]] = n
+        # оставляем только SKU где есть хотя бы один настоящий план
+        if row.get("plan_revenue") or row.get("plan_orders"):
+            out[code] = row
+    return out
+
+
 def merge_plan_fact_into_may(plan_fact, sku_may):
     """План-Факт перебивает метрики мая."""
     INDICATOR_TO_FIELD = {
@@ -819,10 +855,26 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
     days = [snapshot(d) for d in last7]
     days = [d for d in days if d is not None]
 
+    # v2.3 БЛОК 4: накопленная выручка по дням текущего месяца — для темпа на конкретную дату
+    # ключ — день месяца (1..31), значение — суммарная выручка с 1 числа по этот день включительно.
+    month_cumulative = {}
+    cur_month_suffix = "." + ".".join(last_d.split(".")[1:]) if last_d else ""
+    days_in_cur_month = sorted([d for d in funnels if d.endswith(cur_month_suffix)], key=_date_key)
+    running = 0.0
+    for d in days_in_cur_month:
+        rv = (funnels.get(d) or {}).get("revenue") or 0
+        running += rv
+        try:
+            day_n = int(d.split(".")[0])
+            month_cumulative[day_n] = round_n(running, 0)
+        except (ValueError, IndexError):
+            pass
+
     return {
         "last": snapshot(last_d),
         "prev": snapshot(prev_d),
         "days": days,
+        "month_cumulative_revenue": month_cumulative,
         "mpstats_meta": {
             "last_known_date": mpstats_last_date,
             "today": today_str,
@@ -1113,6 +1165,9 @@ def main():
     print("[8/8] daily_summary.md и финальная сборка...")
     summary_md = read_daily_summary()
 
+    sku_plans = compute_sku_plans(plan_fact)
+    print(f"        SKU c планами в xlsx: {len(sku_plans)}")
+
     common = {
         "meta": {
             "last_updated": latest_mtime(),
@@ -1137,6 +1192,7 @@ def main():
         "yesterday": yesterday,
         "sku_history": sku_history,
         "sku_history_monthly": sku_history_monthly,
+        "sku_plans": sku_plans,
         "ai_summary": ai_summary,
         "daily_summary_md": summary_md,
     }

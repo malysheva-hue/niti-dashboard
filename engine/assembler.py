@@ -130,6 +130,128 @@ def _delta_pct(a, b):
     return (b - a) / abs(a) * 100
 
 
+# ============================================================
+# v2.3 БЛОК 1: классификация good_performer
+# Один негатив исключает SKU из "хорошо идёт".
+# ============================================================
+def _mean_window(arr, end_excl, n):
+    if not arr or end_excl < n:
+        return None
+    win = [v for v in arr[end_excl - n:end_excl] if v is not None]
+    return sum(win) / len(win) if win else None
+
+
+def _mean_last(arr, n):
+    if not arr:
+        return None
+    tail = [v for v in arr[-n:] if v is not None]
+    return sum(tail) / len(tail) if tail else None
+
+
+def is_good_performer(sku: dict) -> tuple[bool, str]:
+    """v2.3: SKU попадает в «хорошо идёт» только если ВСЕ негативные условия пройдены
+    И есть ХОТЯ БЫ ОДИН положительный сигнал.
+
+    Возвращает (good: bool, reason: str). reason — почему НЕ хорошо (если good=False)
+    или какой позитив сработал (если good=True).
+    """
+    h = sku.get("history") or {}
+    m = sku.get("month") or {}
+    code = sku.get("code") or ""
+    role = ctx.role_of(sku.get("group", "") or "")
+    norms = ctx.ROLE_NORMS.get(role, {})
+
+    orders = h.get("orders") or []
+    drr_arr = h.get("drr") or []
+    conv_arr = h.get("conv") or []
+    stock_arr = h.get("stock") or []
+    price_arr = h.get("price") or []
+
+    # === НЕГАТИВНЫЕ ФИЛЬТРЫ (любой неуспех = не good) ===
+    # 1. orders_7d_delta >= -5%
+    o_prev = _mean_window(orders, len(orders) - 7, 7) if len(orders) >= 14 else None
+    o_last = _mean_last(orders, 7) if len(orders) >= 7 else None
+    if o_prev and o_last is not None:
+        dp = (o_last - o_prev) / abs(o_prev) * 100
+        if dp < -5:
+            return False, f"orders {dp:.0f}% за 7д"
+
+    # 2. drr_7d_delta_pp <= +2
+    d_prev = _mean_window(drr_arr, len(drr_arr) - 7, 7) if len(drr_arr) >= 14 else None
+    d_last = _mean_last(drr_arr, 7) if len(drr_arr) >= 7 else None
+    if d_prev is not None and d_last is not None:
+        if d_last - d_prev > 2:
+            return False, f"drr +{d_last-d_prev:.1f}пп за 7д"
+
+    # 3. cr_7d_delta_pp >= -3
+    c_prev = _mean_window(conv_arr, len(conv_arr) - 7, 7) if len(conv_arr) >= 14 else None
+    c_last = _mean_last(conv_arr, 7) if len(conv_arr) >= 7 else None
+    if c_prev is not None and c_last is not None:
+        if c_last - c_prev < -3:
+            return False, f"conv {c_last-c_prev:.1f}пп за 7д"
+
+    # 4. margin >= role_floor (только если коридор задан)
+    margin = m.get("margin")
+    m_min = norms.get("margin_min")
+    if margin is not None and m_min is not None and margin < m_min:
+        return False, f"margin {margin:.1f}% < {m_min}%"
+
+    # 5. stock_days_left >= 7
+    stock_now = m.get("stock")
+    velocity = _mean_last(orders, 7)
+    if stock_now is not None and velocity and velocity > 0:
+        dz = stock_now / velocity
+        if dz < 7:
+            return False, f"остаток на {dz:.1f}д"
+
+    # === ХОТЯ БЫ ОДИН ПОЗИТИВ ===
+    positives = []
+    # звезда плана
+    if code in ctx.STARS_CODES:
+        positives.append("star")
+    # заказы +20%
+    if o_prev and o_last and (o_last - o_prev) / abs(o_prev) * 100 >= 20:
+        positives.append("orders+20%")
+    # конверсия >=4%
+    if c_last is not None and c_last >= 4:
+        positives.append(f"conv {c_last:.1f}%")
+    # эффект снижения цены: цена −5% за 7 дней → заказы +30%
+    p_prev = _mean_window(price_arr, len(price_arr) - 7, 7) if len(price_arr) >= 14 else None
+    p_last = _mean_last(price_arr, 7) if len(price_arr) >= 7 else None
+    if p_prev and p_last and o_prev and o_last:
+        price_dp = (p_last - p_prev) / abs(p_prev) * 100
+        orders_dp = (o_last - o_prev) / abs(o_prev) * 100
+        if price_dp <= -5 and orders_dp >= 30:
+            positives.append("эффект скидки")
+
+    if not positives:
+        return False, "нет позитивных сигналов"
+    return True, ", ".join(positives)
+
+
+def filter_findings_classification(findings: list) -> list:
+    """v2.3: пересортировка opportunity → risk если SKU не проходит good_performer.
+
+    Не выкидываем finding, просто меняем task_type/priority.
+    """
+    out = []
+    for f in findings:
+        if f.task_type != "opportunity":
+            out.append(f)
+            continue
+        good, reason = is_good_performer(f.sku_data)
+        if good:
+            out.append(f)
+        else:
+            # перевод в risk, +25 к severity чтобы пройти приоритизацию
+            f.task_type = "risk"
+            f.severity_score = (f.severity_score or 0) + 25
+            f.priority = "yellow" if f.severity_score < 120 else "red"
+            f.diagnostics = (f.diagnostics or []) + [f"reclassified: {reason}"]
+            out.append(f)
+    return out
+
+
 def _build_changes(sku: dict) -> list[dict]:
     """v1.8: для карточки — что изменилось за 7 дней.
     Сравниваем последние 7 дней vs предыдущие 7.
@@ -271,13 +393,167 @@ def _build_verdict(changes: list[dict], priority: str) -> tuple[str, str]:
     return ("Смешанная динамика за 7 дней.", "same")
 
 
-def render_task(finding: Finding) -> dict:
+def _build_reason(changes: list[dict]) -> str | None:
+    """v2.3 БЛОК 7: автовывод о возможной причине по динамике changes.
+
+    Возвращает строку или None если данных недостаточно.
+    """
+    price_dp = orders_dp = drr_dp = conv_dp = stock_dp = None
+    stock_status = None
+    for c in changes:
+        if c.get("label") == "Цена для покупателя":
+            price_dp = c.get("delta_pct")
+        elif c.get("label") == "Заказы/день":
+            orders_dp = c.get("delta_pct")
+        elif c.get("label") == "ДРР":
+            drr_dp = c.get("delta_pp")
+        elif c.get("label") == "Конверсия в заказ":
+            conv_dp = c.get("delta_pp")
+        elif c.get("kind") == "stock":
+            stock_status = c.get("status")
+    if all(v is None for v in (price_dp, orders_dp, drr_dp, conv_dp, stock_status)):
+        return None
+
+    # ДРР удвоился + конверсия рухнула + цена почти не менялась
+    if (drr_dp is not None and drr_dp > 10
+            and conv_dp is not None and conv_dp < -10
+            and price_dp is not None and abs(price_dp) < 5):
+        return ("ДРР удвоился, конверсия рухнула, наша цена почти не менялась. "
+                "Скорее всего СПП от ВБ упала + конкуренты ушли в скидку. "
+                "Проверить топ-5 в выдаче ВБ.")
+
+    # СПП упала + конверсия упала
+    if conv_dp is not None and conv_dp < -10 and (price_dp is None or price_dp >= 0):
+        return ("Конверсия в заказ просела при стабильной цене — цена для покупателя выросла "
+                "из-за снижения СПП от ВБ. Зайти в ближайшую акцию ВБ, чтобы алгоритм поднял СПП.")
+
+    # ДРР вырос + заказы не растут
+    if drr_dp is not None and drr_dp > 5 and orders_dp is not None and abs(orders_dp) < 10:
+        return ("ДРР вырос, заказы не выросли — реклама неэффективна. "
+                "Проверить ставки и список ключевых запросов.")
+
+    # цена снижена + заказы выросли
+    if price_dp is not None and price_dp < -5 and orders_dp is not None and orders_dp > 30:
+        return (f"Снижение цены на {abs(price_dp):.1f}% дало рост заказов +{orders_dp:.0f}%. "
+                "Снижение работает, держим до восстановления маржи или роста СПП.")
+
+    # цена выросла + заказы упали
+    if price_dp is not None and price_dp > 3 and orders_dp is not None and orders_dp < -20:
+        return (f"После повышения цены на {price_dp:.1f}% заказы упали на {abs(orders_dp):.0f}%. "
+                "Спрос эластичный, рассмотреть откат к прежней цене.")
+
+    # заказы упали + остаток в красной зоне (резкая распродажа)
+    if orders_dp is not None and orders_dp < -30 and stock_status == "red":
+        return ("Заказы упали при обнулении остатка — возможна ошибка остатков или потеря "
+                "выкупа на ВБ. Проверить кабинет.")
+
+    # заказы упали + остаток вырос (товар залегает)
+    if orders_dp is not None and orders_dp < -30 and stock_status in (None, "flat", "yellow"):
+        return ("Заказы упали при росте/стабильном остатке — товар залегает. "
+                "Проверить позицию в выдаче и качество фото.")
+
+    # всё стабильно
+    if all(v is None or abs(v) < 5 for v in (orders_dp, drr_dp, conv_dp)) and (price_dp is None or abs(price_dp) < 3):
+        return ("Метрики стабильны, видимых причин для проблемы нет. "
+                "Возможно сезонное колебание.")
+
+    return None
+
+
+def _adjust_variants_for_context(variants: list[str], changes: list[dict]) -> list[str]:
+    """v2.3 БЛОК 9: если цена снижена >5% за 7 дней — убираем советы «зайти в акцию»
+    и подменяем контекстными. Иначе оставляем как есть."""
+    price_dp = None
+    orders_dp = None
+    drr_dp = None
+    for c in changes:
+        if c.get("label") == "Цена для покупателя":
+            price_dp = c.get("delta_pct")
+        elif c.get("label") == "Заказы/день":
+            orders_dp = c.get("delta_pct")
+        elif c.get("label") == "ДРР":
+            drr_dp = c.get("delta_pp")
+    if price_dp is None or price_dp > -5:
+        return variants
+    # Цена снижена >5% — товар уже в акции/скидке. Фильтруем «акция/спп через кабинет».
+    bad_tokens = ("акци", "скидку wildberries", "ближайшую акцию")
+    filtered = [v for v in variants if not any(t.lower() in v.lower() for t in bad_tokens)]
+    extra = []
+    if drr_dp is not None and drr_dp > 5:
+        extra.append("Цена снижена, но ДРР растёт — проверь топ-5 в выдаче ВБ, конкуренты тоже могли уйти в скидку")
+    elif orders_dp is not None and orders_dp > 30:
+        extra.append("Снижение цены даёт рост заказов — удерживаем цену до восстановления маржи")
+    else:
+        extra.append("Снижение цены 5+ дней без эффекта — подожди ещё 2-3 дня или проверь позиции в выдаче")
+    return extra + filtered
+
+
+def _build_plan_info(sku: dict, sku_plans: dict, current_month: str) -> dict | None:
+    """v2.3 БЛОК 5: блок плана по SKU. None если плана нет."""
+    code = sku.get("code")
+    if not code or not sku_plans:
+        return None
+    p = sku_plans.get(code) or {}
+    plan_r = p.get("plan_revenue")
+    plan_o = p.get("plan_orders")
+    fact_r = p.get("fact_revenue") or (sku.get("month") or {}).get("revenue")
+    fact_o = p.get("fact_orders") or (sku.get("month") or {}).get("orders")
+    if not plan_r and not plan_o:
+        return None
+
+    # темп на сегодня (как и в company_summary)
+    from datetime import date as _date
+    pct = None
+    days_left = None
+    if current_month:
+        try:
+            y, m_ = (int(x) for x in current_month.split("-"))
+            dim = (_date(y if m_ < 12 else y + 1, (m_ % 12) + 1, 1) - _date(y, m_, 1)).days
+            today = _date.today()
+            if today.year == y and today.month == m_:
+                dop = today.day
+                days_left = dim - dop
+            elif today > _date(y, m_, dim):
+                dop = dim
+                days_left = 0
+            else:
+                dop = 0
+                days_left = dim
+            if plan_r and fact_r is not None and dop > 0:
+                expected_at = plan_r * dop / dim
+                if expected_at > 0:
+                    pct = fact_r / expected_at * 100
+        except Exception:
+            pass
+
+    out = {
+        "plan_revenue": plan_r,
+        "plan_orders": plan_o,
+        "fact_revenue": fact_r,
+        "fact_orders": fact_o,
+        "tempo_pct": round(pct) if pct is not None else None,
+        "days_left": days_left,
+    }
+    return out
+
+
+def render_task(finding: Finding, sku_plans: dict = None, current_month: str = None) -> dict:
     """v1.8: расширенная структура задачи — attention / changes / variants / verdict."""
     sku = finding.sku_data
     attention = _problem_text(finding)
     variants = actions.get_variants(finding.rule_id)
     changes = _build_changes(sku)
+    variants = _adjust_variants_for_context(variants, changes)
+
+    # v2.3 БЛОК 1: если SKU был переклассифицирован из opportunity в risk —
+    # переписываем attention под реальную проблему.
+    reclass = next((d for d in (finding.diagnostics or []) if isinstance(d, str) and d.startswith("reclassified:")), None)
+    if reclass and finding.task_type == "risk":
+        symptom = reclass.replace("reclassified:", "").strip()
+        attention = f"Несмотря на хорошие месячные показатели — за 7 дней проседает: {symptom}."
     verdict_text, verdict_dir = _build_verdict(changes, finding.priority)
+    plan_info = _build_plan_info(sku, sku_plans or {}, current_month) if sku_plans else None
+    reason = _build_reason(changes)
 
     return {
         "sku": finding.sku_code,
@@ -290,6 +566,9 @@ def render_task(finding: Finding) -> dict:
         "variants": variants,
         "verdict": verdict_text,
         "verdict_dir": verdict_dir,
+        # v2.3:
+        "plan_info": plan_info,
+        "reason": reason,
         # обратная совместимость для модалки SKU и старого UI:
         "problem": attention,
         "action": variants[0] if variants else "",
@@ -778,8 +1057,14 @@ def render_loco_risk_status(data: dict) -> list[dict]:
 # СБОРКА ИТОГА
 # ============================================================
 def build_summary(findings: list[Finding], data: dict, engine_meta_extra: dict = None) -> dict:
-    """Главная функция — возвращает dict, готовый к сериализации в ai_summary.json."""
-    tasks = [render_task(f) for f in findings]
+    """Главная функция — возвращает dict, готовый к сериализации в ai_summary.json.
+
+    v2.3: filter_findings_classification применяется в update.py до prioritize.
+    Здесь повторно не вызываем.
+    """
+    sku_plans = data.get("sku_plans") or {}
+    current_month = (data.get("meta") or {}).get("current_month")
+    tasks = [render_task(f, sku_plans=sku_plans, current_month=current_month) for f in findings]
 
     manager_blocks = {
         mgr: render_manager_block(mgr, findings, data) for mgr in ctx.ACTIVE_MANAGERS

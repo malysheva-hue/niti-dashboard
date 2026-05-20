@@ -166,10 +166,13 @@ class PatternEngine:
         """Извлекает серию из sku по имени метрики."""
         h = sku.get("history", {}) or {}
         m = sku.get("month", {}) or {}
-        # история по метрике
+        # история по метрике (включая drr/conv/profit для v2.3 1-day операторов)
         if metric in ("orders", "revenue", "stock", "spp", "price"):
             return h.get(metric) or []
-        # месячный одиночный показатель (последнее значение)
+        # v2.3: для single_day_change drr/conv берём из history; для threshold — из месяца.
+        # _run_op подменяет на месячное число там, где это threshold.
+        if metric in ("drr", "conv", "profit") and h.get(metric):
+            return h.get(metric) or []
         if metric in ("margin", "drr", "tacos", "turnover"):
             return m.get(metric)
         if metric == "category":
@@ -194,6 +197,11 @@ class PatternEngine:
                           window_days=op_cfg.get("window_days", 7),
                           direction=op_cfg.get("direction", "down"),
                           min_change_pct=op_cfg.get("min_change_pct", -30))
+            if name == "single_day_change":
+                return fn(series,
+                          metric=op_cfg.get("delta_type", "pct"),
+                          direction=op_cfg.get("direction", "down"),
+                          threshold=op_cfg.get("threshold", 50))
             if name == "price_jump_detected":
                 return fn(series,
                           window_days=op_cfg.get("window_days", 7),
@@ -210,11 +218,17 @@ class PatternEngine:
                 velocity = sum(clean) / len(clean) if clean else 0
                 return fn(stock, velocity, safety_days=op_cfg.get("safety_days", 7))
             if name == "threshold":
-                # series может быть числом (margin/drr/turnover) или None
-                val = series if not isinstance(series, list) else None
+                # v2.3: threshold всегда берёт месячное число (month-aggregate), даже если history-серия есть.
+                m_month = sku.get("month") or {}
+                val = m_month.get(metric) if metric else None
+                if val is None and not isinstance(series, list):
+                    val = series
                 return fn(val, min=op_cfg.get("min"), max=op_cfg.get("max"))
             if name == "threshold_by_role":
-                val = series if not isinstance(series, list) else None
+                m_month = sku.get("month") or {}
+                val = m_month.get(metric) if metric else None
+                if val is None and not isinstance(series, list):
+                    val = series
                 role = ctx.role_of(sku.get("group", "") or "")
                 # multiplier для DRR_RUNAWAY
                 mult = op_cfg.get("multiplier")
@@ -465,6 +479,16 @@ class PatternEngine:
                     continue
                 selected_risk.append(f)
                 per_mgr[f.manager] = per_mgr.get(f.manager, 0) + 1
+
+        # v2.3: reclassified opp→risk также инжектируются первыми (важные сигналы за 7 дней)
+        reclass_findings = [f for f in risks
+                            if any(isinstance(d, str) and d.startswith("reclassified:")
+                                   for d in (f.diagnostics or []))]
+        for f in reclass_findings:
+            if f in selected_risk:
+                continue
+            selected_risk.append(f)
+            per_mgr[f.manager] = per_mgr.get(f.manager, 0) + 1
 
         for f in risks:
             if f in selected_risk:

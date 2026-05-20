@@ -1,0 +1,18 @@
+id: STAGNATION_NO_ORDERS
+description: Залёг — оборачиваемость >150 дней при остатке >50 шт
+severity_base: 50
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
+triggers:
+  - operator: threshold
+    metric: turnover
+    max: 150
+  - operator: threshold
+    metric: stock
+    max: 50
+diagnostics: []
+action_lookup:
+  default: stagnation.boost
+escalation:
+  red_threshold: 80
+  yellow_threshold: 50

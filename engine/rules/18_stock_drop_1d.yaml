@@ -1,0 +1,18 @@
+id: STOCK_DROP_1D
+description: Остаток упал >30% за один день (резкая распродажа или ошибка остатков)
+severity_base: 50
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База]
+  require_active: true
+triggers:
+  - operator: single_day_change
+    metric: stock
+    delta_type: pct
+    direction: down
+    threshold: 30
+diagnostics: []
+action_lookup:
+  default: oos.normal_priority
+escalation:
+  red_threshold: 75
+  yellow_threshold: 50

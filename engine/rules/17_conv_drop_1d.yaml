@@ -1,0 +1,18 @@
+id: CONV_DROP_1D
+description: Конверсия в заказ упала >20% за один день
+severity_base: 45
+applies_to:
+  roles: [Локомотив, Маржинальный, Допродажный, База, Новинка]
+  require_active: true
+triggers:
+  - operator: single_day_change
+    metric: conv
+    delta_type: pct
+    direction: down
+    threshold: 20
+diagnostics: []
+action_lookup:
+  default: order_drop.competitor_pressure
+escalation:
+  red_threshold: 80
+  yellow_threshold: 45

@@ -294,7 +294,7 @@ def parse_funnels_xlsx():
     targeted = STAR_CODES | LOCO_RISK_CODES
     by_code = {}
     overall = {}
-    for path in sorted(INPUTS_DIR.glob("*воронка*.xlsx")):
+    for path in sorted(p for p in INPUTS_DIR.glob("*.xlsx") if "воронка" in p.name.lower()):
         m = re.search(r"с (\d+)-(\d+)-(\d+) по", path.name)
         if not m:
             continue
@@ -671,7 +671,7 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
 
     funnels = {}
     funnels_by_sku = {}  # {date: {code: orders_sku}}
-    for path in sorted(INPUTS_DIR.glob("*воронка*.xlsx")):
+    for path in sorted(p for p in INPUTS_DIR.glob("*.xlsx") if "воронка" in p.name.lower()):
         m = _re.search(r"с (\d+)-(\d+)-(\d+) по", path.name)
         if not m:
             continue
@@ -690,9 +690,15 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
             if i is None: return None
             v = values[i]
             return float(v) if isinstance(v, (int, float)) else None
+        def get_alt(*names):
+            for n in names:
+                v = get(n)
+                if v is not None:
+                    return v
+            return None
         funnels[date_csv] = {
             "revenue": get("Заказали на сумму, ₽"),
-            "orders":  get("Заказали, шт"),
+            "orders":  get_alt("Заказали, шт", "Заказали товаров, шт"),
             "buyouts_qty":    get("Выкупили, шт"),
             "buyouts_amount": get("Выкупили на сумму, ₽"),
             "avg_price":      get("Средняя цена, ₽"),
@@ -709,7 +715,7 @@ def parse_daily_yesterday(sku_monthly, plan_fact=None):
                 h2 = rr[1]
                 idx2 = {h: i for i, h in enumerate(h2) if h}
                 code_i = idx2.get("Артикул продавца")
-                orders_i = idx2.get("Заказали, шт")
+                orders_i = idx2.get("Заказали, шт") or idx2.get("Заказали товаров, шт")
                 rev_i = idx2.get("Заказали на сумму, ₽")
                 day_data = {}
                 for r in rr[2:]:
